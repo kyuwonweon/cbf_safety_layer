@@ -1,0 +1,15 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # 1kHz loop
+
+velocity_group_controller:
+  ros__parameters:
+    type: velocity_controllers/JointGroupVelocityController
+    joints:
+      - fer_joint1
+      - fer_joint2
+      - fer_joint3
+      - fer_joint4
+      - fer_joint5
+      - fer_joint6
+      - fer_joint7
