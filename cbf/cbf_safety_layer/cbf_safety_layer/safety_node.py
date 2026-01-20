@@ -7,6 +7,8 @@ from sensor_msgs.msg import JointState
 
 import numpy as np
 
+from cbf_safety_interfaces.msg import Constraint
+
 
 class safety_node(Node):
     """Create Safety layer by preventing safety layer."""
@@ -25,6 +27,9 @@ class safety_node(Node):
                                                '/joint_states',
                                                self.js_cb,
                                                10)
+        self.constraint_pub = self.create_publisher(Constraint,
+                                                    '/safety_constraint',
+                                                    10)
 
     def js_cb(self, msg):
         """
@@ -34,7 +39,19 @@ class safety_node(Node):
         """
         q = np.array(msg.position)
         pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacement(self.model, self.data)
+        pin.updateFramePlacements(self.model, self.data)
+        J = pin.computeFrameJacobian(self.model, self.data, q, self.hand_id,
+                                     pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
 
-        hand_placement = self.data.oMf[self.hand_id]  # Returns SE3 object
-        hand_pos = hand_placement.translation
+        # Worksapce Constraint
+        # Prevent hitting the table by setting safety margin(h)
+        height_margin = 0.05
+        current_z = self.data.oMf[self.hand_id].translation[2]
+        h = current_z - height_margin
+
+        safety_msg = Constraint()
+        safety_msg.value = h
+
+        J_z = J[2, :]  # desired state
+        safety_msg.gradient = J_z.tolist()
+        self.constraint_pub.publish(safety_msg)
