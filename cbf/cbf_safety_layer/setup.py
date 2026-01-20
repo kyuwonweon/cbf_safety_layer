@@ -51,6 +51,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'safety_node = cbf_safety_layer.safety_node:main',
+            'mock_test = cbf_safety_layer.mock_test:main',
         ],
     },
 )

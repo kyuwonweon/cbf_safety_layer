@@ -1,5 +1,6 @@
 """Define safety layer to prevent collision."""
 from ament_index_python.packages import get_package_share_directory
+import rclpy
 from rclpy.node import Node
 import pinocchio as pin
 import os
@@ -10,14 +11,14 @@ import numpy as np
 from cbf_safety_interfaces.msg import Constraint
 
 
-class safety_node(Node):
+class SafetyNode(Node):
     """Create Safety layer by preventing safety layer."""
 
     def __init__(self):
         """Initialize the safety node class."""
         super().__init__('safetynode')
-        urdf_dir = get_package_share_directory('fanka_description')
-        urdf_path = os.path.join(urdf_dir, 'robots/panda_arm.urdf')
+        urdf_dir = get_package_share_directory('franka_description')
+        urdf_path = os.path.join(urdf_dir, 'robots/fer/fer.urdf')
 
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
@@ -55,3 +56,16 @@ class safety_node(Node):
         J_z = J[2, :]  # desired state
         safety_msg.gradient = J_z.tolist()
         self.constraint_pub.publish(safety_msg)
+
+
+def main(args=None):
+    """Spin the node."""
+    rclpy.init(args=args)
+    node = SafetyNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
