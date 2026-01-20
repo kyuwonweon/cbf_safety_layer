@@ -1,0 +1,11 @@
+<launch>
+  <arg name="urdf_file" default="/home/kweon/Desktop/projects/winter/ws/src/cbf/franka_description/robots/fer/fer.urdf" />
+
+  <node pkg="robot_state_publisher" exec="robot_state_publisher" name="robot_state_publisher">
+    <param name="robot_description" value="$(command 'cat $(var urdf_file)')" type="str" />
+  </node>
+
+  <node pkg="cbf_safety_layer" exec="mock_test" name="mock_robot" />
+  <node pkg="cbf_safety_layer" exec="safety_node" name="safety_node" />
+  <node pkg="rviz2" exec="rviz2" name="rviz2" args="-d $(find-pkg-share cbf_safety_layer)/config/cbf_view.rviz" />
+</launch>

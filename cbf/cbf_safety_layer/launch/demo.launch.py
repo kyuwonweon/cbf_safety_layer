@@ -26,7 +26,8 @@ def generate_launch_description():
     spawn_velocity = Node(
         package="controller_manager",
         executable="spawner",
-        arguments=["velocity_group_controller", "--controller-manager", "/controller_manager", "--param-file", 
+        arguments=['velocity_group_controller', '--controller-manager',
+                   '/controller_manager', '--param-file',
                    os.path.join(get_package_share_directory('cbf_safety_layer'), 'config', 'controllers.yaml')],
     )
 

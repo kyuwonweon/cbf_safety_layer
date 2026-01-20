@@ -25,7 +25,7 @@ class MockTest(Node):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = [f'fer_joint{i+1}' for i in range(7)] + \
-                   ['fer_finger_1', 'fer_finger_2']
+                   ['fer_finger_joint1', 'fer_finger_joint2']
         t = time.time()
         q = [0.0, -0.7853981633974483, 0.0, -2.356194490192345,
              0.0, 1.5707963267948966, 0.7853981633974483, 0.0, 0.0]
