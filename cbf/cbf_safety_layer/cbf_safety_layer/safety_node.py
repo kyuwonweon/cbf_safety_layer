@@ -24,6 +24,14 @@ class SafetyNode(Node):
         self.data = self.model.createData()
         self.hand_id = self.model.getFrameId('fer_hand')
         self.elbow_id = self.model.getFrameId('fer_link4')
+
+        # CBF Parameters
+        self.gamma = 5.0
+        self.safety_margin = 0.05
+        # State variables
+        self.q = np.zeros(self.model.nq)
+        self.v = np.zeros(self.model.nv)
+
         self.js_sub = self.create_subscription(JointState,
                                                '/joint_states',
                                                self.js_cb,
@@ -38,24 +46,36 @@ class SafetyNode(Node):
 
         :param msg: msg from the joint state topic
         """
-        q = np.array(msg.position)
-        pin.forwardKinematics(self.model, self.data, q)
+        self.q = np.array(msg.position)
+        if len(msg.velocity) == self.model.nv:
+            self.v = np.arra(msg.velocity)
+        else:
+            self.v = np.zeros(self.model.nv)
+        pin.forwardKinematics(self.model, self.data, self.q, self.v)
         pin.updateFramePlacements(self.model, self.data)
-        J = pin.computeFrameJacobian(self.model, self.data, q, self.hand_id,
-                                     pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        pin.computeJointJacobians(self.model, self.data, self.q)
 
         # Worksapce Constraint
         # Prevent hitting the table by setting safety margin(h)
-        height_margin = 0.05
         current_z = self.data.oMf[self.hand_id].translation[2]
-        h = current_z - height_margin
+        h = current_z - self.safety_margin
 
-        safety_msg = Constraint()
-        safety_msg.value = h
+        J = pin.getFrameJacobian(self.model, self.data, self.hand_id,
+                                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        grad_h = J[2, :]
 
-        J_z = J[2, :]  # desired state
-        safety_msg.gradient = J_z.tolist()
-        self.constraint_pub.publish(safety_msg)
+        h_dot = grad_h@self.v
+        max_h_dot = -self.gamma*h
+
+        buffer = h_dot - max_h_dot
+
+        if buffer < 0:
+            self.get_logger().info('COLLIDED')
+
+        msg = Constraint()
+        msg.value = h
+        msg.gradient = grad_h.tolist()
+        self.constraint_pub.publish(msg)
 
 
 def main(args=None):

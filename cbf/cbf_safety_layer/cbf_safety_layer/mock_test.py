@@ -15,9 +15,9 @@ class MockTest(Node):
     def __init__(self):
         """Initialize mock test variables."""
         super().__init__('mock_test')
-        # publish to jointstate 
+        # publish to jointstate
         self.pub_ = self.create_publisher(JointState, '/joint_states', 10)
-        self.timer_ = self.create_timer(0.1, self.timer_callback)  #10Hz
+        self.timer_ = self.create_timer(0.1, self.timer_callback)  # 10Hz
         self.get_logger().info('Mock Test Starting')
 
     def timer_callback(self):
