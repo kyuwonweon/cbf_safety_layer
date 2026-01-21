@@ -4,8 +4,15 @@
   <node pkg="robot_state_publisher" exec="robot_state_publisher" name="robot_state_publisher">
     <param name="robot_description" value="$(command 'cat $(var urdf_file)')" type="str" />
   </node>
-
-  <node pkg="cbf_safety_layer" exec="mock_test" name="mock_robot" />
-  <node pkg="cbf_safety_layer" exec="safety_node" name="safety_node" />
+  
+  <node pkg="cbf_safety_layer" exec="mock_test" name="mock_robot" >
+    <remap from="/joint_states" to="/mock/joint_states"/>
+  </node>
+  
+  <node pkg="cbf_safety_layer" exec="safety_node" name="safety_node" >
+    <remap from="/joint_states" to="/mock/joint_states"/>
+    <remap from="/safety/joint_states" to="/joint_states"/>
+  </node>
+  
   <node pkg="rviz2" exec="rviz2" name="rviz2" args="-d $(find-pkg-share cbf_safety_layer)/config/cbf_view.rviz" />
 </launch>

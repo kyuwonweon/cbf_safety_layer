@@ -27,10 +27,15 @@ class MockTest(Node):
         msg.name = [f'fer_joint{i+1}' for i in range(7)] + \
                    ['fer_finger_joint1', 'fer_finger_joint2']
         t = time.time()
+        # Ready Pose of franka
         q = [0.0, -0.7853981633974483, 0.0, -2.356194490192345,
              0.0, 1.5707963267948966, 0.7853981633974483, 0.0, 0.0]
-        q[1] = 0.5*np.sin(t)
+        q[1] = 2*np.sin(t)
         msg.position = q
+
+        v = [0.0] * 9
+        v[1] = 2*np.cos(t)
+        msg.velocity = v
         self.pub_.publish(msg)
 
 
