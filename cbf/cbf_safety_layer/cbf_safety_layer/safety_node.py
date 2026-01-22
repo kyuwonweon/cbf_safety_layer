@@ -10,6 +10,7 @@ import numpy as np
 
 from cbf_safety_interfaces.msg import Constraint
 
+import proxsuite
 
 class SafetyNode(Node):
     """Create Safety layer by preventing safety layer."""
@@ -24,16 +25,28 @@ class SafetyNode(Node):
         # Load physical robot info into Pinocchio
         self.model = pin.buildModelFromUrdf(urdf_path)
         self.data = self.model.createData()
-        self.hand_id = self.model.getFrameId('fer_hand')
-        self.elbow_id = self.model.getFrameId('fer_link4')
+        self.links = ['fer_link4', 'fer_link7', 'fer_hand']
+        self.frame_id = [self.model.getFrameId(n) for n in self.links]
+
+        # Dimensions
+        self.nq = self.model.nq  # size of joint angles vector
+        self.nv = self.model.nv  # size of joint speed vector
 
         # CBF Parameters
         self.alpha = 10.0
         self.safety_margin = 0.05
 
-        # State variables
-        self.q = np.zeros(self.model.nq)  # Joint angles
-        self.v = np.zeros(self.model.nv)  # Joint velocity
+        # # State variables
+        # self.q = np.zeros(self.model.nq)  # Joint angles
+        # self.v = np.zeros(self.model.nv)  # Joint velocity
+
+        # Proxsuite solver setup
+        # Equality constraint:0 , inequality: 1F
+        n_constraints = len(self.links)
+        self.qp = proxsuite.proxqp.dense.QP(self.nv, 0, n_constraints)
+        self.qp.settings.eps_abs = 1.0e-5
+        self.qp.settings.verbose = False
+        self.qp.settings.initial_guess = proxsuite.proxqp.InitialGuess.WARM_START_WITH_PREVIOUS_RESULT
 
         self.js_sub = self.create_subscription(JointState,
                                                '/joint_states',
@@ -45,50 +58,72 @@ class SafetyNode(Node):
         self.constraint_pub = self.create_publisher(Constraint,
                                                     '/safety_constraint',
                                                     10)
+        self.q = np.zeros(self.nq)
+        self.get_logger().info('Safety Node and QP Initialized')
 
     def js_cb(self, msg):
         """
-        Call Joint State callback function.
+        Read input v_des and solve with QP to output v_safe.
 
         :param msg: msg from the joint state topic
         """
-        self.q = np.array(msg.position)
-        if len(msg.velocity) == self.model.nv:
-            self.v = np.array(msg.velocity)
+        # Input
+        input_q = np.array(msg.position)
+        if len(msg.velocity) > 0:
+            input_v = np.array(msg.velocity)
         else:
-            self.v = np.zeros(self.model.nv)
+            input_v = np.zeros(len(input_q))
+
+        if len(input_q) == 7 and self.nq == 9:
+            self.q = np.concatenate([input_q, [0, 0]])
+            v_des = np.concatenate([input_v, [0, 0]])
+        else:
+            self.q = input_q
+            v_des = input_v
 
         # calculate pos and ori of every joint relative to world
         # input : q (angles), output: joint positions
-        pin.forwardKinematics(self.model, self.data, self.q, self.v)
+        pin.forwardKinematics(self.model, self.data, self.q, v_des)
         # calculate location of frame attached to joint
         # input: self.data, output: hand position(x,y,z)
         pin.updateFramePlacements(self.model, self.data)
         # calculate Jacobian of the robot
         pin.computeJointJacobians(self.model, self.data, self.q)
 
-        # Worksapce Constraint
-        # Prevent hitting the table by setting safety margin(h)
-        current_z = self.data.oMf[self.hand_id].translation[2]
-        h = current_z - self.safety_margin
+        # Cost Function
+        H = np.eye(self.nv)
+        g = -v_des
 
-        # Get jacobian of the hand
-        J = pin.getFrameJacobian(self.model, self.data, self.hand_id,
-                                 pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-        # Z-row of jacobian
-        grad_h = J[2, :]
+        # Lists for stacked constraints
+        C_list = []
+        l_list = []
+        u_list = []
 
-        h_dot = grad_h @ self.v
-        psi = h_dot + self.alpha*h
+        for f_id in self.frame_id:
+            # h = z_current - safety_margin
+            h = self.data.oMf[f_id].translation[2] - self.safety_margin
+            J = pin.getFrameJacobian(self.model, self.data, f_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            grad_h = J[2, :]  # Z-row only
 
-        if psi < 0:
-            self.get_logger().info('COLLIDED')
-            v_safe = - (grad_h*psi) / np.dot(grad_h, grad_h) + self.v
-        else:
-            v_safe = self.v
+            C_list.append(grad_h.reshape(1, self.nv))
+            l_list.append(np.array([-self.alpha * h]))
+            u_list.append(np.array([np.inf]))
+
+        C = np.vstack(C_list)
+        lower = np.concatenate(l_list)
+        upper = np.concatenate(u_list)
+
+        # --- D. SOLVE ---
+        # Pass the stacked matrices to the solver
+        self.qp.init(H, g, np.zeros((0, self.nv)), np.zeros(0),
+                     C, lower, upper)
+        self.qp.solve()
+
+        # Extract the optimal velocity
+        v_safe = self.qp.results.x
 
         dt = 0.1
-        q_safe = self.q+v_safe*dt
+        q_safe = self.q + v_safe*dt
 
         j_msg = JointState()
         j_msg.header = msg.header
