@@ -5,7 +5,9 @@ from rclpy.node import Node
 import pinocchio as pin
 import os
 from sensor_msgs.msg import JointState
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import Marker, MarkerArray, InteractiveMarker, InteractiveMarkerControl
+from interactive_markers.interactive_marker_server import InteractiveMarkerServer
+
 from geometry_msgs.msg import Point
 
 import numpy as np
@@ -51,6 +53,12 @@ class SafetyNode(Node):
         self.qp.settings.verbose = False
         self.qp.settings.initial_guess = proxsuite.proxqp.InitialGuess.WARM_START_WITH_PREVIOUS_RESULT
 
+        # Obstacle
+        self.obs_pose = np.array([0.5, 0.0, 0.4])
+
+        self.obs_sub = self.create_subscription(Point, 'obstacle_pose',
+                                                self.obs_cb, 10)
+
         self.js_sub = self.create_subscription(JointState,
                                                '/joint_states',
                                                self.js_cb,
@@ -64,6 +72,67 @@ class SafetyNode(Node):
         self.marker_pub = self.create_publisher(MarkerArray,
                                                 '/safety_marker',
                                                 10)
+        self.interactive_server = InteractiveMarkerServer(self,
+                                                          'interactive_marker')
+
+        int_marker = InteractiveMarker()
+        int_marker.header.frame_id = 'base'
+        int_marker.name = 'sphere_obs'
+        int_marker.scale = 0.3
+        int_marker.pose.position.x = self.obs_pose[0]
+        int_marker.pose.position.y = self.obs_pose[1]
+        int_marker.pose.position.z = self.obs_pose[2]
+
+        visual = Marker()
+        visual.type = Marker.SPHERE
+        visual.scale.x = 0.2
+        visual.scale.y = 0.2
+        visual.scale.z = 0.2
+        visual.color.r = 0.0
+        visual.color.g = 1.0
+        visual.color.b = 0.0
+        visual.color.a = 1.0
+        
+        sphere_control = InteractiveMarkerControl()
+        sphere_control.always_visible = True
+        sphere_control.markers.append(visual)
+        sphere_control.interaction_mode = InteractiveMarkerControl.MOVE_3D
+        int_marker.controls.append(sphere_control)
+
+        # X-Axis (Red)
+        control_x = InteractiveMarkerControl()
+        control_x.name = 'move_x'
+        control_x.orientation.w = 1.0
+        control_x.orientation.x = 1.0
+        control_x.orientation.y = 0.0
+        control_x.orientation.z = 0.0
+        control_x.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        int_marker.controls.append(control_x)
+
+        # Y-Axis (Green)
+        control_y = InteractiveMarkerControl()
+        control_y.name = 'move_y'
+        control_y.orientation.w = 1.0
+        control_y.orientation.x = 0.0
+        control_y.orientation.y = 1.0
+        control_y.orientation.z = 0.0
+        control_y.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        int_marker.controls.append(control_y)
+
+        # Z-Axis (Blue)
+        control_z = InteractiveMarkerControl()
+        control_z.name = 'move_z'
+        control_z.orientation.w = 1.0
+        control_z.orientation.x = 0.0
+        control_z.orientation.y = 0.0
+        control_z.orientation.z = 1.0
+        control_z.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        int_marker.controls.append(control_z)
+
+        self.interactive_server.insert(int_marker,
+                                       feedback_callback=self.fb_callback)
+        self.interactive_server.applyChanges()
+
         self.q = np.zeros(self.nq)
         self.get_logger().info('Safety Node and QP Initialized')
 
@@ -118,12 +187,11 @@ class SafetyNode(Node):
             u_list.append(np.array([np.inf]))
 
         # Sphere obstacle
-        obs_pose = np.array([0.5, 0.0, 0.4])
         obs_r = 0.15
 
         for f_id in self.frame_id:
             pos = self.data.oMf[f_id].translation
-            diff = pos - obs_pose
+            diff = pos - self.obs_pose
             dist = np.linalg.norm(diff)
             h = dist - obs_r - self.safety_margin
 
@@ -178,24 +246,6 @@ class SafetyNode(Node):
         stamp = self.get_clock().now().to_msg()
         id_counter = 0
 
-        obs_pose = np.array([0.5, 0.0, 0.4])
-        obs_marker = Marker()
-        obs_marker.header.frame_id = 'base'
-        obs_marker.header.stamp = stamp
-        obs_marker.id = 999
-        obs_marker.type = Marker.SPHERE
-        obs_marker.action = Marker.ADD
-        obs_marker.scale.x = 0.3
-        obs_marker.scale.y = 0.3
-        obs_marker.scale.z = 0.3
-
-        obs_marker.color.r = 0.0
-        obs_marker.color.g = 1.0
-        obs_marker.color.b = 0.0
-        obs_marker.color.a = 1.0
-        obs_marker.pose.position.x, obs_marker.pose.position.y, obs_marker.pose.position.z = obs_pose
-        marker_array.markers.append(obs_marker)
-
         for id_ in self.frame_id:
             pos = self.data.oMf[id_].translation
             # collision sphere
@@ -222,6 +272,13 @@ class SafetyNode(Node):
             marker_array.markers.append(sphere)
             id_counter += 1
 
+            diff = pos - self.obs_pose
+            dist = np.linalg.norm(diff)
+            if dist > 1e-6:
+                grad = diff/dist
+            else:
+                grad = np.array([1.0, 0.0, 0.0])
+
             arrow = Marker()
             arrow.header.frame_id = 'base'
             arrow.header.stamp = stamp
@@ -242,16 +299,32 @@ class SafetyNode(Node):
             start_pose.x, start_pose.y, start_pose.z = pos[0], pos[1], pos[2]
 
             end_pose = Point()
-            gradient_scale = 0.3
-            end_pose.x = pos[0] + gradient_scale
-            end_pose.y = pos[1] + gradient_scale
-            end_pose.z = pos[2] + gradient_scale
+            end_pose.x = pos[0] + grad[0]*0.3
+            end_pose.y = pos[1] + grad[1]*0.3
+            end_pose.z = pos[2] + grad[2]*0.3
 
             arrow.points = [start_pose, end_pose]
             marker_array.markers.append(arrow)
             id_counter += 1
 
         self.marker_pub.publish(marker_array)
+
+    def obs_cb(self, msg):
+        """
+        Update obstacel postion.
+
+        :param msg: message
+        """
+        self.obs_pose = np.array([msg.x, msg.y, msg.z])
+
+    def fb_callback(self, feedback):
+        """
+        Update target with feedback.
+
+        :param feedback: feedback from control server
+        """
+        p = feedback.pose.position
+        self.obs_pose = np.array([p.x, p.y, p.z])
 
 
 def main(args=None):
