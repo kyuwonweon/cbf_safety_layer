@@ -5,12 +5,15 @@ from rclpy.node import Node
 import pinocchio as pin
 import os
 from sensor_msgs.msg import JointState
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 
 import numpy as np
 
 from cbf_safety_interfaces.msg import Constraint
 
 import proxsuite
+
 
 class SafetyNode(Node):
     """Create Safety layer by preventing safety layer."""
@@ -42,7 +45,7 @@ class SafetyNode(Node):
 
         # Proxsuite solver setup
         # Equality constraint:0 , inequality: 1F
-        n_constraints = len(self.links)
+        n_constraints = 2*len(self.links)
         self.qp = proxsuite.proxqp.dense.QP(self.nv, 0, n_constraints)
         self.qp.settings.eps_abs = 1.0e-5
         self.qp.settings.verbose = False
@@ -58,6 +61,9 @@ class SafetyNode(Node):
         self.constraint_pub = self.create_publisher(Constraint,
                                                     '/safety_constraint',
                                                     10)
+        self.marker_pub = self.create_publisher(MarkerArray,
+                                                '/safety_marker',
+                                                10)
         self.q = np.zeros(self.nq)
         self.get_logger().info('Safety Node and QP Initialized')
 
@@ -100,21 +106,46 @@ class SafetyNode(Node):
         u_list = []
 
         for f_id in self.frame_id:
+            # floor constraint
             # h = z_current - safety_margin
             h = self.data.oMf[f_id].translation[2] - self.safety_margin
-            J = pin.getFrameJacobian(self.model, self.data, f_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            J = pin.getFrameJacobian(self.model, self.data, f_id,
+                                     pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
             grad_h = J[2, :]  # Z-row only
 
             C_list.append(grad_h.reshape(1, self.nv))
             l_list.append(np.array([-self.alpha * h]))
             u_list.append(np.array([np.inf]))
 
+        # Sphere obstacle
+        obs_pose = np.array([0.5, 0.0, 0.4])
+        obs_r = 0.15
+
+        for f_id in self.frame_id:
+            pos = self.data.oMf[f_id].translation
+            diff = pos - obs_pose
+            dist = np.linalg.norm(diff)
+            h = dist - obs_r - self.safety_margin
+
+            if dist > 1e-6:
+                grad_h = diff/dist
+            else:
+                grad_h = np.array([1.0, 0.0, 0.0])
+
+            J = pin.getFrameJacobian(self.model, self.data, f_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            J_trans = J[:3, :] 
+
+            # Constraint
+            con = grad_h @ J_trans
+            C_list.append(con.reshape(1, self.nv))
+            l_list.append(np.array([-self.alpha*h]))
+            u_list.append(np.array([np.inf]))
+
         C = np.vstack(C_list)
         lower = np.concatenate(l_list)
         upper = np.concatenate(u_list)
 
-        # --- D. SOLVE ---
-        # Pass the stacked matrices to the solver
+        # solve
         self.qp.init(H, g, np.zeros((0, self.nv)), np.zeros(0),
                      C, lower, upper)
         self.qp.solve()
@@ -137,6 +168,90 @@ class SafetyNode(Node):
         c_msg.value = h
         c_msg.gradient = grad_h.tolist()
         self.constraint_pub.publish(c_msg)
+
+        # publish collision markers
+        self.collision_markers()
+
+    def collision_markers(self):
+        """Publish markers for collision points and gradient."""
+        marker_array = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        id_counter = 0
+
+        obs_pose = np.array([0.5, 0.0, 0.4])
+        obs_marker = Marker()
+        obs_marker.header.frame_id = 'base'
+        obs_marker.header.stamp = stamp
+        obs_marker.id = 999
+        obs_marker.type = Marker.SPHERE
+        obs_marker.action = Marker.ADD
+        obs_marker.scale.x = 0.3
+        obs_marker.scale.y = 0.3
+        obs_marker.scale.z = 0.3
+
+        obs_marker.color.r = 0.0
+        obs_marker.color.g = 1.0
+        obs_marker.color.b = 0.0
+        obs_marker.color.a = 1.0
+        obs_marker.pose.position.x, obs_marker.pose.position.y, obs_marker.pose.position.z = obs_pose
+        marker_array.markers.append(obs_marker)
+
+        for id_ in self.frame_id:
+            pos = self.data.oMf[id_].translation
+            # collision sphere
+            sphere = Marker()
+            sphere.header.frame_id = 'base'
+            sphere.header.stamp = stamp
+            sphere.id = id_counter
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+
+            sphere.scale.x = 0.1
+            sphere.scale.y = 0.1
+            sphere.scale.z = 0.1
+
+            sphere.color.r = 1.0
+            sphere.color.g = 0.0
+            sphere.color.b = 0.0
+            sphere.color.a = 1.0
+
+            sphere.pose.position.x = pos[0]
+            sphere.pose.position.y = pos[1]
+            sphere.pose.position.z = pos[2]
+
+            marker_array.markers.append(sphere)
+            id_counter += 1
+
+            arrow = Marker()
+            arrow.header.frame_id = 'base'
+            arrow.header.stamp = stamp
+            arrow.id = id_counter
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+
+            arrow.scale.x = 0.02
+            arrow.scale.y = 0.05
+            arrow.scale.z = 0.05
+
+            arrow.color.r = 0.0
+            arrow.color.g = 0.0
+            arrow.color.b = 1.0
+            arrow.color.a = 1.0
+
+            start_pose = Point()
+            start_pose.x, start_pose.y, start_pose.z = pos[0], pos[1], pos[2]
+
+            end_pose = Point()
+            gradient_scale = 0.3
+            end_pose.x = pos[0] + gradient_scale
+            end_pose.y = pos[1] + gradient_scale
+            end_pose.z = pos[2] + gradient_scale
+
+            arrow.points = [start_pose, end_pose]
+            marker_array.markers.append(arrow)
+            id_counter += 1
+
+        self.marker_pub.publish(marker_array)
 
 
 def main(args=None):
