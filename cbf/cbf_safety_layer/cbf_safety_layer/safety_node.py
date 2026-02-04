@@ -518,7 +518,12 @@ class SafetyNode(Node):
         self.obs_pose = np.array([p.x, p.y, p.z])
 
     def closest_point_between_segments(self, seg1, seg2):
-        """Get closet point between segments."""
+        """
+        Get closest point between two different segments.
+        
+        :param seg1: segment 1 (p1, p2)
+        :param seg2: segment 2 (p3, p4)
+        """
         p1, p2 = np.array(seg1[0]), np.array(seg1[1])
         p3, p4 = np.array(seg2[0]), np.array(seg2[1])
         v1 = p2 - p1
@@ -537,6 +542,7 @@ class SafetyNode(Node):
         seg_proj = np.dot(v1, v2)
         gap_proj_1 = np.dot(v1, gap)
         gap_proj_2 = np.dot(v2, gap)
+        # Squared area of the parallelogram between two direction vectors 
         det = (len_sq_v1 * len_sq_v2) - (seg_proj**2)
 
         if det < 1e-6:  # Parallel
