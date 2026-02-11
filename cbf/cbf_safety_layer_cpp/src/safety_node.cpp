@@ -64,12 +64,11 @@ public:
         v_safe_ = Eigen::VectorXd::Zero(nv_);
 
         // Capsule
-        capsules_["base"]      = {"fer_link0", "fer_link1", 0.13};
-        capsules_["upper_arm"] = {"fer_link1", "fer_link4", 0.12};
-        capsules_["forearm"]   = {"fer_link4", "fer_link6", 0.10};
-        capsules_["hand"]      = {"fer_link6", "fer_hand",  0.10};
-        capsules_["finger_L"]  = {"fer_hand",  "fer_leftfinger", 0.05};
-        capsules_["finger_R"]  = {"fer_hand",  "fer_rightfinger", 0.04};
+        capsules_["base"]      = {"fer_link0", "fer_link1", 0.15};
+        capsules_["shoulder"]  = {"fer_link1", "fer_link3", 0.10};
+        capsules_["upper_arm"] = {"fer_link3", "fer_link4", 0.10};
+        capsules_["forearm"]   = {"fer_link4", "fer_link7", 0.13};
+        capsules_["hand"]      = {"fer_link7", "fer_hand",  0.11};
 
         v_user_command_ = Eigen::VectorXd::Zero(nv_);
 
@@ -241,28 +240,50 @@ private:
             if (!model_.existFrame(capsule.end_frame) || !model_.existFrame(capsule.start_frame)) continue;
             auto id_start = model_.getFrameId(capsule.start_frame);
             auto id_end = model_.getFrameId(capsule.end_frame);
-            Eigen::Vector3d p_start = data_.oMf[id_start].translation();
-            Eigen::Vector3d p_end = data_.oMf[id_end].translation();
+            
+            // Raw frame positions for Jacobian calc
+            Eigen::Vector3d p_frame_start = data_.oMf[id_start].translation(); 
+            Eigen::Vector3d p_frame_end = data_.oMf[id_end].translation();
 
+            Eigen::Vector3d p_s = p_frame_start;
+            Eigen::Vector3d p_e = p_frame_end;
+            
+            Eigen::Vector3d axis = p_e - p_s;
+            double len = axis.norm();
+            if (len > 1e-5) {
+                Eigen::Vector3d dir = axis.normalized();
+                if (name != "base") {
+                    p_s -= dir * 0.10;
+                }
+                if (capsule.end_frame != "fer_hand_tcp"){
+                    p_e += dir * 0.10;
+                }
+            }
+
+            // Floor check (using extended points)
             if (name != "base") {
-                double h_floor = p_end[2] - capsule.radius - safety_margin_;
+                double h_floor = p_e[2] - capsule.radius - safety_margin_;
                 if (h_floor < 0.2) { 
                     Eigen::MatrixXd J_end(6, nv_); J_end.setZero();
                     pinocchio::getFrameJacobian(model_, data_, id_end, pinocchio::LOCAL_WORLD_ALIGNED, J_end);
-                    C_rows.push_back(J_end.row(2)); 
+                    // Adjust Jacobian for lever arm from Frame to Extended Tip
+                    Eigen::Vector3d lever = p_e - p_frame_end;
+                    Eigen::MatrixXd J_tip = J_end.topRows(3) - skew(lever) * J_end.bottomRows(3);
+
+                    C_rows.push_back(J_tip.row(2)); 
                     l_vals.push_back(-alpha_ * std::max(h_floor, 0.001)); 
                     u_vals.push_back(1e20); 
                 }
             }
 
-            auto res = closest_segment_point(p_start, p_end, obs_pose_);
+            auto res = closest_segment_point(p_s, p_e, obs_pose_);
             double dist = (res.first - res.second).norm();
             double h_obs = dist - (capsule.radius + 0.05 + safety_margin_);
             if (h_obs < 0.4) {
                 Eigen::Vector3d n = (dist > 1e-6) ? ((res.first - res.second) / dist) : Eigen::Vector3d(1,0,0);
                 Eigen::MatrixXd J_start(6, nv_); J_start.setZero();
                 pinocchio::getFrameJacobian(model_, data_, id_start, pinocchio::LOCAL_WORLD_ALIGNED, J_start);
-                Eigen::Vector3d lever = res.first - p_start;
+                Eigen::Vector3d lever = res.first - p_frame_start;
                 Eigen::MatrixXd J_point = J_start.topRows(3) - skew(lever) * J_start.bottomRows(3);
                 C_rows.push_back(n.transpose() * J_point);
                 l_vals.push_back(-alpha_ * std::max(h_obs, 0.001));
@@ -341,9 +362,10 @@ private:
 
         visualization_msgs::msg::Marker delete_all;
         delete_all.action = visualization_msgs::msg::Marker::DELETEALL;
+        delete_all.id = 0;
         ma.markers.push_back(delete_all);
 
-        int id = 0;
+        int id = 1;
         for(const auto& [name, capsule] : capsules_) {
             if (!model_.existFrame(capsule.end_frame) || !model_.existFrame(capsule.start_frame)) continue;
 
@@ -352,6 +374,14 @@ private:
             
             Eigen::Vector3d p1 = data_.oMf[id_start].translation();
             Eigen::Vector3d p2 = data_.oMf[id_end].translation();
+
+            Eigen::Vector3d axis = p2 - p1;
+            if (axis.norm() > 1e-5) {
+                Eigen::Vector3d dir = axis.normalized();
+                if (name != "base") p1 -= dir * 0.10; 
+                p2 += dir * 0.10;
+            }
+
             visualization_msgs::msg::Marker m;
             
             m.header.frame_id = "base";
