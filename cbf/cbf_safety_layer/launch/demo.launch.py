@@ -22,7 +22,7 @@ def generate_launch_description():
                 'robot_ip': 'dont_care',
                 'use_fake_hardware': 'true',
                 'arm_id': 'fer',
-                'use_rviz': 'false', 
+                'use_rviz': 'false',
             }.items(),
         )
     ])
@@ -40,8 +40,8 @@ def generate_launch_description():
         executable='safety_node_cpp',
         output='screen',
         remappings=[
-            ('/joint_states_source', '/joint_states_source'), 
-            ('/safety/joint_states', '/joint_states'),       
+            ('/joint_states_source', '/joint_states_source'),
+            ('/safety/joint_states', '/joint_states'),
         ]
     )
 

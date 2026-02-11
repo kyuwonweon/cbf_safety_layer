@@ -55,9 +55,10 @@ public:
         q_max_ <<  2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973, 0.04, 0.04;
         v_limit_ << 2.1750,  2.1750,  2.1750,  2.1750,  2.6100,  2.6100,  2.6100, 0.1, 0.1;
 
-        // Safety Buffer: Shrink limits slightly (5%) to prevent hitting hard-stops
-        q_min_ *= 0.95; 
-        q_max_ *= 0.95;
+        // Safety Buffer to prevent hitting hard-stops
+        double padding = 0.02; 
+        q_min_ = q_min_.array() + padding;
+        q_max_ = q_max_.array() - padding;
         v_limit_ *= 0.95;
 
         q_safe_ = Eigen::VectorXd::Zero(nq_);
@@ -198,6 +199,7 @@ private:
     }
 
     void joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        auto start_time = std::chrono::high_resolution_clock::now();
         auto now = this->get_clock()->now();
         if (first_run_) {
             last_time_ = now;
@@ -286,7 +288,7 @@ private:
                 Eigen::Vector3d lever = res.first - p_frame_start;
                 Eigen::MatrixXd J_point = J_start.topRows(3) - skew(lever) * J_start.bottomRows(3);
                 C_rows.push_back(n.transpose() * J_point);
-                l_vals.push_back(-alpha_ * std::max(h_obs, 0.001));
+                l_vals.push_back(-alpha_ * h_obs);
                 u_vals.push_back(1e20);
             }
         }
@@ -330,6 +332,11 @@ private:
         std_msgs::msg::Float64MultiArray cmd_msg;
         for(int i=0; i<7; ++i) cmd_msg.data.push_back(v_safe_[i]); 
         pub_cmd_->publish(cmd_msg);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        if (duration>800){
+            RCLCPP_WARN(this -> get_logger(), "Safety Loop slow: %ld us",duration);
+        }
 
         q_safe_ += v_safe_ * dt;
 
@@ -351,7 +358,7 @@ private:
         pub_safe_->publish(msg_out);
 
         loop_count_++;
-        if ((now - last_viz_time_).seconds() > 0.033) {
+        if ((now - last_viz_time_).seconds() > 0.1) {
             publish_markers();
             last_viz_time_ = now;
         }
@@ -430,14 +437,13 @@ private:
     {
         int num_obs = C_obs.size();
         int max_rows = C_total.rows();
-
-        // don't write past the end of the matrix
+        
         if (num_obs + nv_ > max_rows) {
             RCLCPP_ERROR(this->get_logger(), "Too many constraints! Increase max_constraints in joint_cb.");
             return; 
         }
 
-        // Reset the matrix to Zero (important to clear old constraints)
+        // Reset the matrix to Zero to clear old constraints
         C_total.setZero();
         
         // Reset bounds to infinity to have the robot unconstrained by default
@@ -457,6 +463,8 @@ private:
             C_total(row, i) = 1.0;
             double v_to_min = (q_min_(i) - q_safe_(i)) / dt;
             double v_to_max = (q_max_(i) - q_safe_(i)) / dt;
+            v_to_min = std::clamp(v_to_min, -v_limit_(i), v_limit_(i));
+            v_to_max = std::clamp(v_to_max, -v_limit_(i), v_limit_(i));
             l_total(row) = std::max(-v_limit_(i), v_to_min);
             u_total(row) = std::min(v_limit_(i), v_to_max);
         }
