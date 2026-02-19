@@ -15,6 +15,7 @@
 #include <proxsuite/proxqp/dense/dense.hpp> 
 #include <optional> 
 #include <vector>
+#include <mutex>
 
 using namespace std::chrono_literals;
 
@@ -27,472 +28,667 @@ struct Capsule {
 class SafetyNode : public rclcpp::Node {
 public:
     SafetyNode() : Node("safety_node_cpp") {
-        // load robot
-        this->declare_parameter("robot_description", rclcpp::ParameterValue(std::string("")));
-        std::string urdf_string;
-        rclcpp::sleep_for(std::chrono::milliseconds(500)); 
+        // Declare parameters for both robots
+        declare_parameter("self_robot_description", rclcpp::ParameterValue(std::string("")));
+        declare_parameter("other_robot_description", rclcpp::ParameterValue(std::string("")));
+        declare_parameter("use_fallback_urdf", rclcpp::ParameterValue(true));
+        declare_parameter("fallback_urdf_package", rclcpp::ParameterValue(std::string("franka_description")));
+        declare_parameter("fallback_urdf_path", rclcpp::ParameterValue(std::string("/robots/fer/fer.urdf")));
+        declare_parameter("self_frame_prefix", rclcpp::ParameterValue(std::string("")));
+        declare_parameter("other_frame_prefix", rclcpp::ParameterValue(std::string("")));
+        declare_parameter("base_offset_x", 0.0);
+        declare_parameter("base_offset_y", 0.0);
+        declare_parameter("base_offset_z", 0.0);
+        base_offset = Eigen::Vector3d::Zero();
+
+        base_offset(0) = get_parameter("base_offset_x").as_double();
+        base_offset(1) = get_parameter("base_offset_y").as_double();
+        base_offset(2) = get_parameter("base_offset_z").as_double();
+
+        RCLCPP_INFO(get_logger(), "Robot Base Offset: [%.2f, %.2f, %.2f]", 
+                    base_offset(0), base_offset(1), base_offset(2));
+
+        std::string self_urdf, other_urdf;
+        rclcpp::sleep_for(500ms); 
         
-        if (!this->get_parameter("robot_description", urdf_string) || urdf_string.empty()) {
-            RCLCPP_WARN(this->get_logger(), "Param 'robot_description' empty. Using fallback.");
-            std::string urdf_pkg = ament_index_cpp::get_package_share_directory("franka_description");
-            std::string urdf_path = urdf_pkg + "/robots/fer/fer.urdf";
-            pinocchio::urdf::buildModel(urdf_path, model_);
+        // Load self robot model
+        if (!get_parameter("self_robot_description", self_urdf) || self_urdf.empty()) {
+            if (get_parameter("use_fallback_urdf").as_bool()) {
+                RCLCPP_WARN(get_logger(), "Param 'self_robot_description' empty. Using fallback URDF.");
+                std::string pkg = get_parameter("fallback_urdf_package").as_string();
+                std::string path = get_parameter("fallback_urdf_path").as_string();
+                std::string urdf_pkg = ament_index_cpp::get_package_share_directory(pkg);
+                std::string urdf_path = urdf_pkg + path;
+                pinocchio::urdf::buildModel(urdf_path, model_self);
+            } else {
+                RCLCPP_ERROR(get_logger(), "No self_robot_description provided and fallback disabled!");
+                return;
+            }
         } else {
-            pinocchio::urdf::buildModelFromXML(urdf_string, model_);
+            pinocchio::urdf::buildModelFromXML(self_urdf, model_self);
         }
         
-        data_ = pinocchio::Data(model_);
-        nq_ = model_.nq;
-        nv_ = model_.nv;
-        RCLCPP_INFO(this->get_logger(), "Model Loaded: nq=%d, nv=%d", nq_, nv_);
+        // Load other robot model
+        if (!get_parameter("other_robot_description", other_urdf) || other_urdf.empty()) {
+            if (get_parameter("use_fallback_urdf").as_bool()) {
+                RCLCPP_WARN(get_logger(), "Param 'other_robot_description' empty. Using fallback URDF.");
+                std::string pkg = get_parameter("fallback_urdf_package").as_string();
+                std::string path = get_parameter("fallback_urdf_path").as_string();
+                std::string urdf_pkg = ament_index_cpp::get_package_share_directory(pkg);
+                std::string urdf_path = urdf_pkg + path;
+                pinocchio::urdf::buildModel(urdf_path, model_other);
+            } else {
+                RCLCPP_WARN(get_logger(), "No other_robot_description provided. Single robot mode.");
+                model_other = model_self;
+            }
+        } else {
+            pinocchio::urdf::buildModelFromXML(other_urdf, model_other);
+        }
+        
+        data_self = pinocchio::Data(model_self);
+        data_other = pinocchio::Data(model_other);
+        nq_self = model_self.nq;
+        nv_self = model_self.nv;
+        nq_other = model_other.nq;
+        nv_other = model_other.nv;
+        
+        RCLCPP_INFO(get_logger(), "Self Robot Loaded: nq=%d, nv=%d", nq_self, nv_self);
+        RCLCPP_INFO(get_logger(), "Other Robot Loaded: nq=%d, nv=%d", nq_other, nv_other);
 
-        q_min_ = Eigen::VectorXd(nv_);
-        q_max_ = Eigen::VectorXd(nv_);
-        v_limit_ = Eigen::VectorXd(nv_);
+        // Initialize vectors
+        q_min = Eigen::VectorXd(nv_self);
+        q_max = Eigen::VectorXd(nv_self);
+        v_limit = Eigen::VectorXd(nv_self);
 
-        // Standard Franka Research 3 Limits (Radians & Rad/s)
-        q_min_ << -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973, 0.0, 0.0;
-        q_max_ <<  2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973, 0.04, 0.04;
-        v_limit_ << 2.1750,  2.1750,  2.1750,  2.1750,  2.6100,  2.6100,  2.6100, 0.1, 0.1;
+        // Standard Franka Research 3 Limits
+        q_min << -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973, 0.0, 0.0;
+        q_max <<  2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973, 0.04, 0.04;
+        v_limit << 2.1750,  2.1750,  2.1750,  2.1750,  2.6100,  2.6100,  2.6100, 0.1, 0.1;
 
-        // Safety Buffer to prevent hitting hard-stops
+        // Safety Buffer
         double padding = 0.02; 
-        q_min_ = q_min_.array() + padding;
-        q_max_ = q_max_.array() - padding;
-        v_limit_ *= 0.95;
+        q_min = q_min.array() + padding;
+        q_max = q_max.array() - padding;
+        v_limit *= 0.95;
 
-        q_safe_ = Eigen::VectorXd::Zero(nq_);
-        v_safe_ = Eigen::VectorXd::Zero(nv_);
+        q_safe = Eigen::VectorXd::Zero(nq_self);
+        q_other_robot = Eigen::VectorXd::Zero(nq_other);
+        v_safe = Eigen::VectorXd::Zero(nv_self);
+        v_user_command = Eigen::VectorXd::Zero(nv_self);
 
-        // Capsule
-        capsules_["base"]      = {"fer_link0", "fer_link1", 0.15};
-        capsules_["shoulder"]  = {"fer_link1", "fer_link3", 0.10};
-        capsules_["upper_arm"] = {"fer_link3", "fer_link4", 0.10};
-        capsules_["forearm"]   = {"fer_link4", "fer_link7", 0.13};
-        capsules_["hand"]      = {"fer_link7", "fer_hand",  0.11};
+        std::string s_pre = get_parameter("self_frame_prefix").as_string();
+        std::string o_pre = get_parameter("other_frame_prefix").as_string();
+        if (s_pre.empty()) s_pre = "fer_";
+        if (o_pre.empty()) o_pre = "fer_";
 
-        v_user_command_ = Eigen::VectorXd::Zero(nv_);
+        joint_names.clear();
+        for (int i = 1; i < model_self.njoints; ++i) {
+            joint_names.push_back(model_self.names[i]);
+        }
+        
+        RCLCPP_INFO(get_logger(), "Loaded %zu joints from model:", joint_names.size());
+        for (const auto& name : joint_names) {
+            RCLCPP_INFO(get_logger(), " - %s", name.c_str());
+        }
+        
+        // Self Capsules 
+        capsules_self["base"]      = {s_pre + "link0", s_pre + "link1", 0.15};
+        capsules_self["link1"]     = {s_pre + "link1", s_pre + "link2", 0.12};
+        capsules_self["link2"]     = {s_pre + "link2", s_pre + "link3", 0.10};
+        capsules_self["link3"]     = {s_pre + "link3", s_pre + "link4", 0.10};
+        capsules_self["link4"]     = {s_pre + "link4", s_pre + "link5", 0.10};
+        capsules_self["link5"]     = {s_pre + "link5", s_pre + "link6", 0.10};
+        capsules_self["link6"]     = {s_pre + "link6", s_pre + "link7", 0.10};
+        capsules_self["hand"]      = {s_pre + "link7", s_pre + "hand",  0.11};
+
+        // Other Robot Capsules
+        capsules_other["base"]      = {o_pre + "link0", o_pre + "link1", 0.15};
+        capsules_other["link1"]     = {o_pre + "link1", o_pre + "link2", 0.12};
+        capsules_other["link2"]     = {o_pre + "link2", o_pre + "link3", 0.10};
+        capsules_other["link3"]     = {o_pre + "link3", o_pre + "link4", 0.10};
+        capsules_other["link4"]     = {o_pre + "link4", o_pre + "link5", 0.10};
+        capsules_other["link5"]     = {o_pre + "link5", o_pre + "link6", 0.10};
+        capsules_other["link6"]     = {o_pre + "link6", o_pre + "link7", 0.10};
+        capsules_other["hand"]      = {o_pre + "link7", o_pre + "hand",  0.11};
+
+        #ifdef NDEBUG
+            RCLCPP_INFO(this->get_logger(), "BUILD STATUS: RELEASE MODE (Optimized)");
+        #else
+            RCLCPP_WARN(this->get_logger(), "BUILD STATUS: DEBUG MODE (Slow!)");
+        #endif
 
         // ROS Setup
         auto qos = rclcpp::QoS(10);
-        sub_js_ = this->create_subscription<sensor_msgs::msg::JointState>(
-            "/joint_states_source", qos, std::bind(&SafetyNode::joint_cb, this, std::placeholders::_1));
-        pub_safe_ = this->create_publisher<sensor_msgs::msg::JointState>("/safety/joint_states", qos);
-        pub_marker_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
+        
+        sub_js_self = create_subscription<sensor_msgs::msg::JointState>(
+            "/joint_states_source", qos, std::bind(&SafetyNode::joint_cb_self, this, std::placeholders::_1));
+        
+        sub_js_other = create_subscription<sensor_msgs::msg::JointState>(
+            "/joint_states_source_other", qos, std::bind(&SafetyNode::joint_cb_other, this, std::placeholders::_1));
+        
+        pub_safe = create_publisher<sensor_msgs::msg::JointState>("/safety/joint_states", qos);
+        pub_marker = create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
+        pub_cmd = create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
 
-        pub_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
-
-        // Update this block in Constructor
-        sub_input_vel_ = this->create_subscription<sensor_msgs::msg::JointState>(
+        sub_input_vel = create_subscription<sensor_msgs::msg::JointState>(
             "/safety/input_joint_states", 10, 
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
-                // Fix: Cast nv_ to size_t
-                if (msg->velocity.size() == (size_t)nv_) {
-                    for(int i=0; i<nv_; ++i) v_user_command_(i) = msg->velocity[i];
-
-                    if (v_user_command_.norm() > 0.1) {
-                        RCLCPP_INFO(this->get_logger(), "RECV CMD: Joint1=%.2f", v_user_command_(0));
-                    
-                    }
+                std::lock_guard<std::mutex> lock(cmd_mutex);
+                if (msg->velocity.size() == static_cast<size_t>(nv_self)) {
+                    for(int i=0; i<nv_self; ++i) v_user_command(i) = msg->velocity[i];
                 }
             });
+
+        // FIXED: Shared obstacle with debouncing to prevent feedback loop
+        pub_obs_pose = create_publisher<geometry_msgs::msg::Point>("/shared_obstacle", 10);
+        sub_obs_pose = create_subscription<geometry_msgs::msg::Point>("/shared_obstacle", 10,
+        [this](const geometry_msgs::msg::Point::SharedPtr msg){
+            auto now = this->get_clock()->now();
+            if ((now - last_obs_update).seconds() < 0.05) return; // Debounce 50ms
+            std::lock_guard<std::mutex> lock(obs_mutex);
+            obs_pose << msg->x, msg->y, msg->z;
+            last_obs_update = now;
+        });
         
-        // Interactive Marker
-        server_ = std::make_shared<interactive_markers::InteractiveMarkerServer>("obstacle_server", this);
-        create_interactive_obstacle();
-        last_viz_time_ = this->get_clock()->now();
+        server = std::make_shared<interactive_markers::InteractiveMarkerServer>("obstacle_server", this);
+        create_interactive_markers();
+        
+        // Periodic refresh for interactive markers (helps with initialization)
+        marker_timer = this->create_wall_timer(
+            std::chrono::seconds(1),
+            [this]() { 
+                if (server) server->applyChanges(); 
+            });
+        
+        last_viz_time = this->get_clock()->now();
         RCLCPP_INFO(this->get_logger(), "Safety Node Ready");
     }
 
 private:
-    pinocchio::Model model_;
-    pinocchio::Data data_;
-    int nq_, nv_;
-    int loop_count_ = 0;
-    rclcpp::Time last_viz_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-    Eigen::VectorXd q_safe_, v_safe_;
-    Eigen::Vector3d obs_pose_ = {0.8, 0.0, 0.4}; 
-    double obs_radius_ = 0.10;
-    double safety_margin_ = 0.02;
-    double alpha_ = 5.0;
+    pinocchio::Model model_self, model_other;
+    pinocchio::Data data_self, data_other;
+    int nq_self, nv_self, nq_other, nv_other;
+    int loop_count = 0;
+    rclcpp::Time last_viz_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    rclcpp::Time last_obs_update = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
-    Eigen::VectorXd v_user_command_; 
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_input_vel_;
+    Eigen::Vector3d base_offset;
+    std::vector<std::string> joint_names;
+    std::vector<Eigen::MatrixXd> C_rows;
+    std::vector<double> l_vals;
     
-    std::map<std::string, Capsule> capsules_;
-    
-    // Global solver pointer
-    std::shared_ptr<proxsuite::proxqp::dense::QP<double>> qp_;
-    
-    bool first_run_ = true;
-    bool solver_initialized_ = false;
-    rclcpp::Time last_time_;
+    Eigen::VectorXd q_safe, v_safe, v_user_command, q_min, q_max, v_limit, q_other_robot;
+    Eigen::Vector3d obs_pose = {0.8, 0.0, 0.4}; 
+    double obs_radius = 0.10, safety_margin = 0.02, alpha = 5.0, floor_height = 0.0;
+    bool first_run = true, solver_initialized = false, other_robot_detected = false;
+    rclcpp::Time last_time;
 
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_;
-    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe_;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker_;
-    rclcpp::TimerBase::SharedPtr viz_timer_;
-    std::shared_ptr<interactive_markers::InteractiveMarkerServer> server_;
-    Eigen::VectorXd q_min_, q_max_, v_limit_;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_input_v_;
-    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd_;
+    std::map<std::string, Capsule> capsules_self, capsules_other;
+    std::shared_ptr<proxsuite::proxqp::dense::QP<double>> qp;
+    std::shared_ptr<interactive_markers::InteractiveMarkerServer> server;
+    rclcpp::TimerBase::SharedPtr marker_timer;
 
-    void create_interactive_obstacle() {
-        visualization_msgs::msg::InteractiveMarker int_marker;
-        int_marker.header.frame_id = "base";
-        int_marker.name = "obstacle_marker";
-        int_marker.scale = 0.3;
-        int_marker.pose.position.x = obs_pose_(0);
-        int_marker.pose.position.y = obs_pose_(1);
-        int_marker.pose.position.z = obs_pose_(2);
+    std::mutex q_other_mutex;
+    std::mutex cmd_mutex;
+    std::mutex obs_mutex;
 
-        visualization_msgs::msg::Marker box_marker;
-        box_marker.type = visualization_msgs::msg::Marker::SPHERE;
-        box_marker.scale.x = obs_radius_ * 2.0;
-        box_marker.scale.y = obs_radius_ * 2.0;
-        box_marker.scale.z = obs_radius_ * 2.0;
-        box_marker.color.r = 1.0; box_marker.color.a = 1.0;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_input_vel;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd;
+    rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr pub_obs_pose;
+    rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr sub_obs_pose;
 
-        visualization_msgs::msg::InteractiveMarkerControl box_control;
-        box_control.always_visible = true;
-        box_control.markers.push_back(box_marker);
-        int_marker.controls.push_back(box_control);
+    void create_interactive_markers() {
+        visualization_msgs::msg::InteractiveMarker obs_marker;
+        obs_marker.header.frame_id = "base";
+        obs_marker.name = "obstacle_marker";
+        obs_marker.pose.position.x = obs_pose(0);
+        obs_marker.pose.position.y = obs_pose(1);
+        obs_marker.pose.position.z = obs_pose(2);
+        obs_marker.scale = 0.3;
 
-        visualization_msgs::msg::InteractiveMarkerControl control;
+        visualization_msgs::msg::Marker sphere;
+        sphere.type = visualization_msgs::msg::Marker::SPHERE;
+        sphere.scale.x = obs_radius * 2.0;
+        sphere.scale.y = obs_radius * 2.0;
+        sphere.scale.z = obs_radius * 2.0;
+        sphere.color.r = 1.0; sphere.color.a = 0.8;
+        
+        visualization_msgs::msg::InteractiveMarkerControl ctrl;
+        ctrl.always_visible = true;
+        ctrl.markers.push_back(sphere);
+        obs_marker.controls.push_back(ctrl);
 
-        // X Axis (Red Arrow)
-        control.orientation.w = 1;
-        control.orientation.x = 1;
-        control.orientation.y = 0;
-        control.orientation.z = 0;
-        control.name = "move_x";
-        control.interaction_mode = visualization_msgs::msg::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
-
-        // Z Axis (Blue Arrow)
-        control.orientation.w = 1;
-        control.orientation.x = 0;
-        control.orientation.y = 1;
-        control.orientation.z = 0;
-        control.name = "move_z";
-        control.interaction_mode = visualization_msgs::msg::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
-
-        // Y Axis (Green Arrow)
-        control.orientation.w = 1;
-        control.orientation.x = 0;
-        control.orientation.y = 0;
-        control.orientation.z = 1;
-        control.name = "move_y";
-        control.interaction_mode = visualization_msgs::msg::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
-
-        server_->insert(int_marker);
-        server_->setCallback(int_marker.name, std::bind(&SafetyNode::process_int_marker, this, std::placeholders::_1));
-        server_->applyChanges();
-    }
-
-    void process_int_marker(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr & feedback) {
-        if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
-            obs_pose_ << feedback->pose.position.x, feedback->pose.position.y, feedback->pose.position.z;
-        }
-    }
-
-    void joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        auto now = this->get_clock()->now();
-        if (first_run_) {
-            last_time_ = now;
-            last_viz_time_ = now;
-            first_run_ = false;
-        }
-        double dt = (now - last_time_).seconds();
-        last_time_ = now;
-        if (dt < 0.001) return;
-
-        Eigen::VectorXd q_input = Eigen::VectorXd::Zero(nq_);
-        size_t limit = std::min((size_t)nq_, msg->position.size());
-        for(size_t i=0; i < limit; ++i){
-            q_input[i] = msg->position[i];
-        }
-
-        q_safe_ = q_input;
-        Eigen::VectorXd v_des = v_user_command_;
-        v_des = v_des.cwiseMin(2.0).cwiseMax(-2.0);
-
-        // Joint Limit Buffers
-        double buffer = 0.15; 
-        for (int i = 0; i < nv_; ++i) {
-            double dist_upper = q_max_(i) - q_safe_(i);
-            if (dist_upper < buffer && v_des(i) > 0) v_des(i) *= std::max(0.0, dist_upper / buffer);
-            double dist_lower = q_safe_(i) - q_min_(i);
-            if (dist_lower < buffer && v_des(i) < 0) v_des(i) *= std::max(0.0, dist_lower / buffer);
-        }
-
-        // Kinematics Update
-        pinocchio::forwardKinematics(model_, data_, q_safe_);
-        pinocchio::updateFramePlacements(model_, data_);
-        pinocchio::computeJointJacobians(model_, data_, q_safe_);
-
-        // Constraint Generation
-        std::vector<Eigen::MatrixXd> C_rows;
-        std::vector<double> l_vals, u_vals;
-
-        for (const auto& [name, capsule] : capsules_) {
-            if (!model_.existFrame(capsule.end_frame) || !model_.existFrame(capsule.start_frame)) continue;
-            auto id_start = model_.getFrameId(capsule.start_frame);
-            auto id_end = model_.getFrameId(capsule.end_frame);
-            
-            // Raw frame positions for Jacobian calc
-            Eigen::Vector3d p_frame_start = data_.oMf[id_start].translation(); 
-            Eigen::Vector3d p_frame_end = data_.oMf[id_end].translation();
-
-            Eigen::Vector3d p_s = p_frame_start;
-            Eigen::Vector3d p_e = p_frame_end;
-            
-            Eigen::Vector3d axis = p_e - p_s;
-            double len = axis.norm();
-            if (len > 1e-5) {
-                Eigen::Vector3d dir = axis.normalized();
-                if (name != "base") {
-                    p_s -= dir * 0.10;
-                }
-                if (capsule.end_frame != "fer_hand_tcp"){
-                    p_e += dir * 0.10;
-                }
-            }
-
-            // Floor check (using extended points)
-            if (name != "base") {
-                double h_floor = p_e[2] - capsule.radius - safety_margin_;
-                if (h_floor < 0.2) { 
-                    Eigen::MatrixXd J_end(6, nv_); J_end.setZero();
-                    pinocchio::getFrameJacobian(model_, data_, id_end, pinocchio::LOCAL_WORLD_ALIGNED, J_end);
-                    // Adjust Jacobian for lever arm from Frame to Extended Tip
-                    Eigen::Vector3d lever = p_e - p_frame_end;
-                    Eigen::MatrixXd J_tip = J_end.topRows(3) - skew(lever) * J_end.bottomRows(3);
-
-                    C_rows.push_back(J_tip.row(2)); 
-                    l_vals.push_back(-alpha_ * std::max(h_floor, 0.001)); 
-                    u_vals.push_back(1e20); 
-                }
-            }
-
-            auto res = closest_segment_point(p_s, p_e, obs_pose_);
-            double dist = (res.first - res.second).norm();
-            double h_obs = dist - (capsule.radius + 0.05 + safety_margin_);
-            if (h_obs < 0.4) {
-                Eigen::Vector3d n = (dist > 1e-6) ? ((res.first - res.second) / dist) : Eigen::Vector3d(1,0,0);
-                Eigen::MatrixXd J_start(6, nv_); J_start.setZero();
-                pinocchio::getFrameJacobian(model_, data_, id_start, pinocchio::LOCAL_WORLD_ALIGNED, J_start);
-                Eigen::Vector3d lever = res.first - p_frame_start;
-                Eigen::MatrixXd J_point = J_start.topRows(3) - skew(lever) * J_start.bottomRows(3);
-                C_rows.push_back(n.transpose() * J_point);
-                l_vals.push_back(-alpha_ * h_obs);
-                u_vals.push_back(1e20);
-            }
-        }
-
-        // QP solver
-        const int max_constraints = 40; 
-        Eigen::MatrixXd C_total = Eigen::MatrixXd::Zero(max_constraints, nv_);
-        Eigen::VectorXd l_total = Eigen::VectorXd::Constant(max_constraints, -1e20);
-        Eigen::VectorXd u_total = Eigen::VectorXd::Constant(max_constraints, +1e20);
-
-        applyJointLimits(C_total, l_total, u_total, C_rows, l_vals, u_vals, dt);
-
-        Eigen::MatrixXd H = Eigen::MatrixXd::Identity(nv_, nv_);
-        Eigen::VectorXd g = -v_des;
-        Eigen::MatrixXd A_eq(0, nv_); Eigen::VectorXd b_eq(0);
-
-        try {
-            if (!solver_initialized_) {
-                qp_ = std::make_shared<proxsuite::proxqp::dense::QP<double>>(nv_, 0, max_constraints);
-                qp_->settings.eps_abs = 1.0e-5; qp_->settings.verbose = false;
-                qp_->init(H, g, A_eq, b_eq, C_total, l_total, u_total);
-                solver_initialized_ = true;
-            } else {
-                qp_->update(H, g, A_eq, b_eq, C_total, l_total, u_total);
-            }
-            qp_->solve();
-            if (qp_->results.info.status == proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
-                v_safe_ = qp_->results.x;
-            } else {
-                v_safe_.setZero();
-            }
-        } catch (const std::exception& e) {
-            v_safe_.setZero();
-            solver_initialized_ = false; 
-        }
-
-        if (loop_count_ % 50 == 0 && v_des.norm() > 0.1) {
-             RCLCPP_INFO(this->get_logger(), "QP OUTPUT: v_safe=[%.2f, %.2f...]", v_safe_(0), v_safe_(1));
-        }
-
-        std_msgs::msg::Float64MultiArray cmd_msg;
-        for(int i=0; i<7; ++i) cmd_msg.data.push_back(v_safe_[i]); 
-        pub_cmd_->publish(cmd_msg);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        if (duration>800){
-            RCLCPP_WARN(this -> get_logger(), "Safety Loop slow: %ld us",duration);
-        }
-
-        q_safe_ += v_safe_ * dt;
-
-        sensor_msgs::msg::JointState msg_out;
-        msg_out.header.stamp = this->get_clock()->now();
-        msg_out.header.frame_id = "base";
-        msg_out.name = {
-            "fer_joint1", "fer_joint2", "fer_joint3", "fer_joint4", 
-            "fer_joint5", "fer_joint6", "fer_joint7", 
-            "fer_finger_joint1", "fer_finger_joint2"
+        auto add_axis = [&](visualization_msgs::msg::InteractiveMarker &m, double w, double x, double y, double z, std::string name) {
+            visualization_msgs::msg::InteractiveMarkerControl c;
+            c.orientation.w = w; c.orientation.x = x; c.orientation.y = y; c.orientation.z = z;
+            c.name = name;
+            c.interaction_mode = visualization_msgs::msg::InteractiveMarkerControl::MOVE_AXIS;
+            m.controls.push_back(c);
         };
 
-        msg_out.position.resize(9);
-        msg_out.velocity.resize(9);
-        for(int i=0; i<9; ++i) {
-            msg_out.position[i] = q_safe_[i];
-            msg_out.velocity[i] = v_safe_[i];
-        }
-        pub_safe_->publish(msg_out);
+        add_axis(obs_marker, 1, 1, 0, 0, "move_x");
+        add_axis(obs_marker, 1, 0, 1, 0, "move_z");
+        add_axis(obs_marker, 1, 0, 0, 1, "move_y");
+        server->insert(obs_marker);
 
-        loop_count_++;
-        if ((now - last_viz_time_).seconds() > 0.1) {
-            publish_markers();
-            last_viz_time_ = now;
+        visualization_msgs::msg::InteractiveMarker f_marker;
+        f_marker.header.frame_id = "base";
+        f_marker.name = "floor_marker";
+        f_marker.pose.position.z = floor_height;
+        f_marker.scale = 0.5;
+        
+        visualization_msgs::msg::Marker plane;
+        plane.type = visualization_msgs::msg::Marker::CUBE;
+        plane.scale.x = 2.0; plane.scale.y = 2.0; plane.scale.z = 0.01;
+        plane.color.b = 1.0; plane.color.a = 0.3;
+        
+        visualization_msgs::msg::InteractiveMarkerControl f_ctrl;
+        f_ctrl.always_visible = true;
+        f_ctrl.markers.push_back(plane);
+        f_marker.controls.push_back(f_ctrl);
+        add_axis(f_marker, 1, 0, 1, 0, "move_z");
+        
+        server->insert(f_marker);
+        server->setCallback("obstacle_marker", std::bind(&SafetyNode::process_obs_feedback, this, std::placeholders::_1));
+        server->setCallback("floor_marker", std::bind(&SafetyNode::process_floor_feedback, this, std::placeholders::_1));
+        server->applyChanges();
+    }
+
+    void process_obs_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr &feedback) {
+        if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
+            std::lock_guard<std::mutex> lock(obs_mutex);
+            obs_pose << feedback->pose.position.x, feedback->pose.position.y, feedback->pose.position.z;
+            
+            geometry_msgs::msg::Point p;
+            p.x = obs_pose(0); p.y = obs_pose(1); p.z = obs_pose(2);
+            pub_obs_pose->publish(p);
+            last_obs_update = this->get_clock()->now();
         }
+    }
+
+    void process_floor_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr &feedback) {
+        if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
+            floor_height = feedback->pose.position.z;
+        }
+    }
+
+    void joint_cb_other(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(q_other_mutex);
+        for (size_t i = 0; i < std::min(static_cast<size_t>(nq_other), msg->position.size()); ++i) {
+            q_other_robot[i] = msg->position[i];
+        }
+        if (!other_robot_detected) {
+            other_robot_detected = true;
+            RCLCPP_INFO(this->get_logger(), "Other robot detected - enabling inter-robot collision avoidance");
+        }
+    }
+
+    void joint_cb_self(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        auto t_start = std::chrono::high_resolution_clock::now();
+        auto now = this->get_clock()->now();
+        if (first_run) {
+            last_time = now;
+            last_viz_time = now;
+            first_run = false;
+            C_rows.reserve(100);
+            l_vals.reserve(100);
+        }
+        double dt = (now - last_time).seconds();
+        last_time = now;
+
+        static bool initial_pose_set = false;
+        if (!initial_pose_set) {
+             for(size_t i = 0; i < std::min(static_cast<size_t>(nq_self), msg->position.size()); ++i) {
+                q_safe[i] = msg->position[i];
+            }
+            initial_pose_set = true;
+        }
+
+        // Update Kinematics 
+        pinocchio::forwardKinematics(model_self, data_self, q_safe);
+        pinocchio::updateFramePlacements(model_self, data_self);
+        
+        // Publish markers at low frequency
+        if (++loop_count % 10 == 0) {
+            publish_markers();
+        }
+        
+        if (dt < 0.001) return;
+
+        Eigen::VectorXd v_des;
+        {
+            std::lock_guard<std::mutex> lock(cmd_mutex);
+            v_des = v_user_command.cwiseMin(2.0).cwiseMax(-2.0);
+        }
+
+        auto t_kin_start = std::chrono::high_resolution_clock::now();
+        // Complete kinematics for constraint generation
+        pinocchio::computeJointJacobians(model_self, data_self, q_safe);
+        auto t_kin_end = std::chrono::high_resolution_clock::now();
+
+        Eigen::VectorXd q_other_copy;
+        bool other_robot_active = false;
+        {
+            std::lock_guard<std::mutex> lock(q_other_mutex);
+            if (other_robot_detected) {
+                q_other_copy = q_other_robot;
+                other_robot_active = true;
+            }
+        }
+
+        Eigen::Vector3d obs_world;
+        {
+            std::lock_guard<std::mutex> lock(obs_mutex);
+            obs_world = obs_pose;
+        }
+        Eigen::Vector3d obs_local = obs_world - base_offset;
+
+        C_rows.clear();
+        l_vals.clear();
+        
+        bool constraints_needed = false;
+        if (!capsules_self.empty()) {
+            if (obs_local.norm()<1.5 || other_robot_active){
+                constraints_needed = true;
+            }
+        }
+
+        if (!constraints_needed) {
+            v_safe = v_des;
+            for (int i=0; i<nv_self; ++i) {
+                double v_min = std::max(-v_limit(i), (q_min(i) - q_safe(i)) / dt);
+                double v_max = std::min(v_limit(i), (q_max(i) - q_safe(i)) / dt);
+                v_safe(i) = std::clamp(v_safe(i), v_min, v_max);
+            }
+            
+            std_msgs::msg::Float64MultiArray cmd;
+            for(int i=0; i<7; ++i) cmd.data.push_back(v_safe[i]);
+            pub_cmd->publish(cmd);
+            
+            q_safe += v_safe * dt;
+            sensor_msgs::msg::JointState msg_out;
+            msg_out.header.stamp = now;
+            msg_out.header.frame_id = "base";
+            msg_out.name = joint_names;
+            msg_out.position.resize(nq_self); 
+            msg_out.velocity.resize(nv_self);
+            for(int i=0; i<nq_self; ++i) msg_out.position[i] = q_safe[i];
+            for(int i=0; i<nv_self; ++i) msg_out.velocity[i] = v_safe[i];
+            pub_safe->publish(msg_out);
+            
+            return; 
+        }
+
+        //debug
+        double min_dist_found = 100.0;
+        std::string closest_link = "";
+
+        for (const auto& [name, cap] : capsules_self) {
+            if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) {
+                // Warning only once to avoid spam
+                static std::set<std::string> warned_frames;
+                if (warned_frames.find(name) == warned_frames.end()) {
+                     RCLCPP_WARN(this->get_logger(), "Frame %s or %s not found", cap.start_frame.c_str(), cap.end_frame.c_str());
+                     warned_frames.insert(name);
+                }
+                continue;
+            }
+
+            auto id_s = model_self.getFrameId(cap.start_frame);
+            auto id_e = model_self.getFrameId(cap.end_frame);
+            Eigen::Vector3d p_s = data_self.oMf[id_s].translation();
+            Eigen::Vector3d p_e = data_self.oMf[id_e].translation();
+            
+            // Floor Constraint - only check if close
+            if (p_e[2] < floor_height + 0.5) {
+                double h_f = p_e[2] - cap.radius - floor_height - safety_margin;
+                if (h_f < 0.15) {
+                    Eigen::MatrixXd J_e(6, nv_self);
+                    pinocchio::getFrameJacobian(model_self, data_self, id_e, pinocchio::LOCAL_WORLD_ALIGNED, J_e);
+                    C_rows.push_back(J_e.row(2));
+                    l_vals.push_back(-alpha * std::max(h_f, 0.001));
+                }
+            }
+
+            // Obstacle Constraint - only if close
+            auto pt = closest_point_on_seg(p_s, p_e, obs_local);
+            double d_p = (pt - obs_local).norm();
+            double surface_dist = d_p - cap.radius - obs_radius;
+
+            if (surface_dist<min_dist_found){
+                min_dist_found = surface_dist;
+                closest_link = name;
+            }
+
+            if (d_p < 0.5) {
+                double h_p = d_p - (cap.radius + obs_radius + safety_margin);
+                if (h_p < 0.25) {
+                    add_constraint(C_rows, l_vals, pt, obs_local, d_p, h_p, id_s, p_s);
+                }
+            }
+        }
+        if (loop_count % 100 == 0) { 
+            RCLCPP_INFO(get_logger(), 
+                "[%s] OBS DEBUG: World=[%.2f, %.2f] | Offset=[%.2f, %.2f] | Local=[%.2f, %.2f] | Closest Link='%s' Dist=%.3fm",
+                get_namespace(),
+                obs_world(0), obs_world(1),
+                base_offset(0), base_offset(1),
+                obs_local(0), obs_local(1),
+                closest_link.c_str(), min_dist_found);
+        }
+
+        auto t_constr_end = std::chrono::high_resolution_clock::now();
+
+        const int max_c = 60;
+        Eigen::MatrixXd C_t = Eigen::MatrixXd::Zero(max_c, nv_self);
+        Eigen::VectorXd l_t = Eigen::VectorXd::Constant(max_c, -1e20);
+        Eigen::VectorXd u_t = Eigen::VectorXd::Constant(max_c, 1e20);
+
+        apply_limits(C_t, l_t, u_t, C_rows, l_vals, dt);
+
+        auto t_qp_start = std::chrono::high_resolution_clock::now();
+
+        try {
+            if (!solver_initialized) {
+                qp = std::make_shared<proxsuite::proxqp::dense::QP<double>>(nv_self, 0, max_c);
+                
+                qp->settings.eps_abs = 1e-3;
+                qp->settings.eps_rel = 1e-3;
+                qp->settings.max_iter = 100;
+                qp->settings.max_iter_in = 10;
+                qp->settings.check_duality_gap = false;
+                qp->settings.verbose = false;
+                qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
+                
+                qp->init(Eigen::MatrixXd::Identity(nv_self, nv_self), -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
+                solver_initialized = true;
+            } else {
+                qp->update(std::nullopt, -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
+            }
+            
+            if (!C_t.allFinite()) { 
+                RCLCPP_ERROR(this->get_logger(), "NaN detected in Constraints!");
+                v_safe.setZero();
+            } else {
+                qp->solve();
+                
+                // OPTIMIZATION 5: Timeout protection
+                auto qp_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::high_resolution_clock::now() - t_qp_start).count();
+                if (qp_dur > 10) {
+                    RCLCPP_ERROR(this->get_logger(), "QP SLOW (%ld ms)!", qp_dur);
+                    v_safe.setZero();
+                } else {
+                    v_safe = (qp->results.info.status == proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) ? 
+                             qp->results.x : Eigen::VectorXd::Zero(nv_self);
+                }
+            }
+        } catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "QP solver exception - emergency stop");
+            v_safe.setZero();
+            solver_initialized = false;
+        }
+
+        auto t_qp_end = std::chrono::high_resolution_clock::now();
+
+        auto d_kin = std::chrono::duration_cast<std::chrono::microseconds>(t_kin_end - t_kin_start).count();
+        auto d_con = std::chrono::duration_cast<std::chrono::microseconds>(t_constr_end - t_kin_end).count();
+        auto d_qp  = std::chrono::duration_cast<std::chrono::microseconds>(t_qp_end - t_qp_start).count();
+        auto d_tot = std::chrono::duration_cast<std::chrono::microseconds>(t_qp_end - t_start).count();
+
+        if (d_tot > 1000) {
+            RCLCPP_WARN(this->get_logger(), "TIMING: Total=%ld us | Kin=%ld | Cons=%ld | QP=%ld", d_tot, d_kin, d_con, d_qp);
+        }
+
+        std_msgs::msg::Float64MultiArray cmd;
+        for(int i=0; i<7; ++i) cmd.data.push_back(v_safe[i]);
+        pub_cmd->publish(cmd);
+
+        q_safe += v_safe * dt;
+        
+        sensor_msgs::msg::JointState msg_out;
+        msg_out.header.stamp = now;
+        msg_out.header.frame_id = "base";
+        msg_out.name = joint_names;
+        msg_out.position.resize(nq_self); 
+        msg_out.velocity.resize(nv_self);
+        for(int i=0; i<nq_self; ++i) msg_out.position[i] = q_safe[i];
+        for(int i=0; i<nv_self; ++i) msg_out.velocity[i] = v_safe[i];
+        pub_safe->publish(msg_out);
+    }
+
+    void add_constraint(std::vector<Eigen::MatrixXd>& C, std::vector<double>& L, 
+                       Eigen::Vector3d p, Eigen::Vector3d obs, double d, double h, 
+                       int id, Eigen::Vector3d p_frame) {
+        Eigen::Vector3d n;
+        if (d > 1e-5) {
+            n = (p - obs) / d;
+        } else {
+            n = (p-p_frame).normalized();
+        }
+        Eigen::MatrixXd J(6, nv_self); 
+        J.setZero(); 
+        pinocchio::getFrameJacobian(model_self, data_self, id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+        Eigen::MatrixXd J_pt = J.topRows(3) - skew(p - p_frame) * J.bottomRows(3);
+        C.push_back(n.transpose() * J_pt); 
+        L.push_back(-alpha * h);
+    }
+
+    void apply_limits(Eigen::MatrixXd& C, Eigen::VectorXd& L, Eigen::VectorXd& U, 
+                 const std::vector<Eigen::MatrixXd>& Cr, const std::vector<double>& Lr, double dt) {
+        C.setZero();
+        L.setConstant(-1e20);
+        U.setConstant(1e20);
+        int row_idx = 0;
+        
+        // Apply Obstacle constraint
+        for (size_t i=0; i<Cr.size() && i<30; ++i) { 
+            if (row_idx >= C.rows()) break;
+            C.row(row_idx) = Cr[i];     // FIXED: row_idx
+            L(row_idx) = std::clamp(Lr[i], -5.0, 5.0);
+            row_idx++;
+        }
+        
+        // Apply Joint velocity limit
+        for (int i=0; i<nv_self; ++i) {
+            if (row_idx >= C.rows()) break; // FIXED: C.rows()
+            
+            C(row_idx, i) = 1.0;            // FIXED: use row_idx, not 'r'
+            
+            double limit_l = std::max(-v_limit(i), (q_min(i) - q_safe(i)) / dt);
+            double limit_u = std::min(v_limit(i), (q_max(i) - q_safe(i)) / dt);
+
+            if (limit_l > limit_u) {
+                double mid = (limit_l + limit_u) / 2.0;
+                limit_l = mid - 1e-4;
+                limit_u = mid + 1e-4;
+            }
+            L(row_idx) = limit_l;           // FIXED: use row_idx
+            U(row_idx) = limit_u;           // FIXED: use row_idx
+            row_idx++;
+        }
+    }
+
+    Eigen::Vector3d closest_point_on_seg(Eigen::Vector3d a, Eigen::Vector3d b, Eigen::Vector3d p) {
+        Eigen::Vector3d ab = b - a; 
+        double len_sq = ab.squaredNorm();
+        if (len_sq < 1e-6){
+            return a;
+        }
+        double t = std::clamp((p - a).dot(ab) / ab.squaredNorm(), 0.0, 1.0); 
+        return a + t * ab;
+    }
+
+    Eigen::Matrix3d skew(Eigen::Vector3d v) { 
+        Eigen::Matrix3d m; 
+        m << 0, -v(2), v(1), v(2), 0, -v(0), -v(1), v(0), 0; 
+        return m; 
     }
 
     void publish_markers() {
         visualization_msgs::msg::MarkerArray ma;
-
-        visualization_msgs::msg::Marker delete_all;
-        delete_all.action = visualization_msgs::msg::Marker::DELETEALL;
-        delete_all.id = 0;
-        ma.markers.push_back(delete_all);
+        visualization_msgs::msg::Marker del; 
+        del.action = visualization_msgs::msg::Marker::DELETEALL; 
+        ma.markers.push_back(del);
+        
+        // FIX 1: Get the correct root frame name (e.g., robot1_fer_link0)
+        // We assume the first capsule's start frame (base -> link1) is the root
+        std::string root_frame = "base";
+        if (capsules_self.find("base") != capsules_self.end()) {
+             root_frame = capsules_self["base"].start_frame; 
+        }
 
         int id = 1;
-        for(const auto& [name, capsule] : capsules_) {
-            if (!model_.existFrame(capsule.end_frame) || !model_.existFrame(capsule.start_frame)) continue;
-
-            auto id_start = model_.getFrameId(capsule.start_frame);
-            auto id_end = model_.getFrameId(capsule.end_frame);
+        for(const auto& [name, cap] : capsules_self) {
+            if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) continue;
             
-            Eigen::Vector3d p1 = data_.oMf[id_start].translation();
-            Eigen::Vector3d p2 = data_.oMf[id_end].translation();
-
-            Eigen::Vector3d axis = p2 - p1;
-            if (axis.norm() > 1e-5) {
-                Eigen::Vector3d dir = axis.normalized();
-                if (name != "base") p1 -= dir * 0.10; 
-                p2 += dir * 0.10;
-            }
-
+            Eigen::Vector3d p1 = data_self.oMf[model_self.getFrameId(cap.start_frame)].translation();
+            Eigen::Vector3d p2 = data_self.oMf[model_self.getFrameId(cap.end_frame)].translation();
+            
             visualization_msgs::msg::Marker m;
-            
-            m.header.frame_id = "base";
-            m.header.stamp = rclcpp::Time(0);
-            m.id = id++;
-            m.type = visualization_msgs::msg::Marker::CYLINDER;
-            m.action = visualization_msgs::msg::Marker::ADD;
-            
-            Eigen::Vector3d center = (p1 + p2) / 2.0;
-            Eigen::Vector3d diff = p2 - p1;
-            
-            double len = diff.norm();
-            m.pose.position.x = center.x();
-            m.pose.position.y = center.y();
-            m.pose.position.z = center.z();
-            
-            Eigen::Vector3d z_axis(0,0,1);
-            Eigen::Quaterniond q; 
-            q.setFromTwoVectors(z_axis, diff);
-            
-            m.pose.orientation.w = q.w();
-            m.pose.orientation.x = q.x();
-            m.pose.orientation.y = q.y();
-            m.pose.orientation.z = q.z();
-            m.scale.x = capsule.radius * 2.0;
-            m.scale.y = capsule.radius * 2.0;
-            m.scale.z = len;
-            m.color.r = 0.0;
-            m.color.g = 1.0;
-            m.color.b = 0.0;
-            m.color.a = 0.5;
-            m.lifetime = rclcpp::Duration::from_seconds(0);
+            m.header.frame_id = root_frame; 
+            m.header.stamp = this->get_clock()->now();
+            m.id = id++; 
+            m.color.g = 1.0; m.color.a = 0.4; 
+
+            double len = (p2 - p1).norm();
+
+            if (len < 1e-4) {
+                // If start and end are same point, draw a Sphere
+                m.type = visualization_msgs::msg::Marker::SPHERE;
+                m.pose.position.x = p1.x(); 
+                m.pose.position.y = p1.y(); 
+                m.pose.position.z = p1.z();
+                m.scale.x = m.scale.y = m.scale.z = cap.radius * 2.0;
+                
+                // Identity orientation
+                m.pose.orientation.w = 1.0; 
+            } else {
+                // Normal Cylinder Capsule
+                m.type = visualization_msgs::msg::Marker::CYLINDER;
+                m.pose.position.x = (p1.x()+p2.x())/2.0; 
+                m.pose.position.y = (p1.y()+p2.y())/2.0; 
+                m.pose.position.z = (p1.z()+p2.z())/2.0;
+                
+                Eigen::Quaterniond q; 
+                q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), p2 - p1);
+                m.pose.orientation.w = q.w(); m.pose.orientation.x = q.x(); 
+                m.pose.orientation.y = q.y(); m.pose.orientation.z = q.z();
+                
+                m.scale.x = m.scale.y = cap.radius * 2.0; 
+                m.scale.z = len; 
+            }
             ma.markers.push_back(m);
         }
-        pub_marker_->publish(ma);
-    }
-
-    void applyJointLimits(
-        Eigen::MatrixXd& C_total, 
-        Eigen::VectorXd& l_total, 
-        Eigen::VectorXd& u_total,
-        const std::vector<Eigen::MatrixXd>& C_obs,
-        const std::vector<double>& l_obs,
-        const std::vector<double>& u_obs,
-        double dt) 
-    {
-        int num_obs = C_obs.size();
-        int max_rows = C_total.rows();
-        
-        if (num_obs + nv_ > max_rows) {
-            RCLCPP_ERROR(this->get_logger(), "Too many constraints! Increase max_constraints in joint_cb.");
-            return; 
-        }
-
-        // Reset the matrix to Zero to clear old constraints
-        C_total.setZero();
-        
-        // Reset bounds to infinity to have the robot unconstrained by default
-        l_total.setConstant(-1e20);
-        u_total.setConstant(1e20);
-
-        // Obstacle constraint
-        for (int i = 0; i < num_obs; ++i) {
-            C_total.row(i) = C_obs[i];
-            l_total(i) = l_obs[i];
-            u_total(i) = u_obs[i];
-        }
-
-        // Joint and velocity limits
-        for (int i = 0; i < nv_; ++i) {
-            int row = num_obs + i;
-            C_total(row, i) = 1.0;
-            double v_to_min = (q_min_(i) - q_safe_(i)) / dt;
-            double v_to_max = (q_max_(i) - q_safe_(i)) / dt;
-            v_to_min = std::clamp(v_to_min, -v_limit_(i), v_limit_(i));
-            v_to_max = std::clamp(v_to_max, -v_limit_(i), v_limit_(i));
-            l_total(row) = std::max(-v_limit_(i), v_to_min);
-            u_total(row) = std::min(v_limit_(i), v_to_max);
-        }
-    }
-
-    Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
-        Eigen::Matrix3d m;
-        m << 0, -v(2), v(1),
-             v(2), 0, -v(0),
-             -v(1), v(0), 0;
-        return m;
-    }
-
-    std::pair<Eigen::Vector3d, Eigen::Vector3d> closest_segment_point(
-        Eigen::Vector3d p1, Eigen::Vector3d p2, Eigen::Vector3d p_obs) 
-    {
-        Eigen::Vector3d v1 = p2 - p1;
-        Eigen::Vector3d gap = p1 - p_obs;
-        double len_sq = v1.squaredNorm();
-        double t = 0.0;
-        if (len_sq > 1e-6) t = std::clamp(-gap.dot(v1) / len_sq, 0.0, 1.0);
-        return {p1 + t * v1, p_obs};
+        pub_marker->publish(ma);
     }
 };
 
-int main(int argc, char **argv) {
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<SafetyNode>());
-    rclcpp::shutdown();
-    return 0;
+int main(int argc, char **argv) { 
+    rclcpp::init(argc, argv); 
+    rclcpp::spin(std::make_shared<SafetyNode>()); 
+    rclcpp::shutdown(); 
+    return 0; 
 }
