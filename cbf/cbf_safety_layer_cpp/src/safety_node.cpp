@@ -5,6 +5,7 @@
 #include <interactive_markers/interactive_marker_server.hpp> 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+
 #include <Eigen/Dense>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
@@ -19,6 +20,7 @@
 
 using namespace std::chrono_literals;
 
+// Define Capsule shape for geometric primitve for the robot
 struct Capsule {
     std::string start_frame;
     std::string end_frame;
@@ -41,6 +43,7 @@ public:
         declare_parameter("base_offset_z", 0.0);
         base_offset = Eigen::Vector3d::Zero();
 
+        // get robot offsets from the "base" frame for rivz
         base_offset(0) = get_parameter("base_offset_x").as_double();
         base_offset(1) = get_parameter("base_offset_y").as_double();
         base_offset(2) = get_parameter("base_offset_z").as_double();
@@ -49,6 +52,7 @@ public:
                     base_offset(0), base_offset(1), base_offset(2));
 
         std::string self_urdf, other_urdf;
+        // Wait to ensure the urdf xml file is grabbed
         rclcpp::sleep_for(500ms); 
         
         // Load self robot model
@@ -85,6 +89,9 @@ public:
             pinocchio::urdf::buildModelFromXML(other_urdf, model_other);
         }
         
+        // -----------------------------------------------------------------------
+        // Kinematic Data Intialization 
+        // -----------------------------------------------------------------------
         data_self = pinocchio::Data(model_self);
         data_other = pinocchio::Data(model_other);
         nq_self = model_self.nq;
@@ -111,11 +118,15 @@ public:
         q_max = q_max.array() - padding;
         v_limit *= 0.95;
 
+        // Setup empty vectors to hold safe and commanded velocity output
         q_safe = Eigen::VectorXd::Zero(nq_self);
         q_other_robot = Eigen::VectorXd::Zero(nq_other);
         v_safe = Eigen::VectorXd::Zero(nv_self);
         v_user_command = Eigen::VectorXd::Zero(nv_self);
 
+        // -------------------------------------------------------
+        // Setup Geometric primitve to encapsulate robot 
+        // -------------------------------------------------------
         std::string s_pre = get_parameter("self_frame_prefix").as_string();
         std::string o_pre = get_parameter("other_frame_prefix").as_string();
         if (s_pre.empty()) s_pre = "fer_";
@@ -151,21 +162,29 @@ public:
         capsules_other["link6"]     = {o_pre + "link6", o_pre + "link7", 0.10};
         capsules_other["hand"]      = {o_pre + "link7", o_pre + "hand",  0.11};
 
+        // -------------------------------------------------------------
+        // ROS 2 Communication diagnostics 
+        //--------------------------------------------------------------
+        // Check if the compilation is in release mode for faster computation 
         #ifdef NDEBUG
             RCLCPP_INFO(this->get_logger(), "BUILD STATUS: RELEASE MODE (Optimized)");
         #else
             RCLCPP_WARN(this->get_logger(), "BUILD STATUS: DEBUG MODE (Slow!)");
         #endif
 
-        // ROS Setup
+        // --------------------------------------------------------------
+        // ROS 2 Setup
+        // --------------------------------------------------------------
         auto qos = rclcpp::QoS(10);
         
+        // Joint state subscription for robots
         sub_js_self = create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states_source", qos, std::bind(&SafetyNode::joint_cb_self, this, std::placeholders::_1));
         
         sub_js_other = create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states_source_other", qos, std::bind(&SafetyNode::joint_cb_other, this, std::placeholders::_1));
         
+        // 
         pub_safe = create_publisher<sensor_msgs::msg::JointState>("/safety/joint_states", qos);
         pub_marker = create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
         pub_cmd = create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
@@ -179,7 +198,7 @@ public:
                 }
             });
 
-        // FIXED: Shared obstacle with debouncing to prevent feedback loop
+        
         pub_obs_pose = create_publisher<geometry_msgs::msg::Point>("/shared_obstacle", 10);
         sub_obs_pose = create_subscription<geometry_msgs::msg::Point>("/shared_obstacle", 10,
         [this](const geometry_msgs::msg::Point::SharedPtr msg){
@@ -190,10 +209,11 @@ public:
             last_obs_update = now;
         });
         
+        // ------------------------------------------------------------------
+        // Marker for Obstacle showing 
+        // ------------------------------------------------------------------
         server = std::make_shared<interactive_markers::InteractiveMarkerServer>("obstacle_server", this);
         create_interactive_markers();
-        
-        // Periodic refresh for interactive markers (helps with initialization)
         marker_timer = this->create_wall_timer(
             std::chrono::seconds(1),
             [this]() { 
@@ -326,18 +346,23 @@ private:
     }
 
     void joint_cb_self(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        // Profiling how long code takes at each section (local execution timing)
         auto t_start = std::chrono::high_resolution_clock::now();
+        // ROS 2 Time Acquisition
         auto now = this->get_clock()->now();
+        
         if (first_run) {
-            last_time = now;
-            last_viz_time = now;
+            last_time = now; // Ensure dt calculation is accurate 
+            last_viz_time = now; 
             first_run = false;
+            // Memory optimization to prevent constant resizing of vectors 
             C_rows.reserve(100);
             l_vals.reserve(100);
         }
         double dt = (now - last_time).seconds();
         last_time = now;
 
+        // initialize robot position by getting real robot position than all zero default state
         static bool initial_pose_set = false;
         if (!initial_pose_set) {
              for(size_t i = 0; i < std::min(static_cast<size_t>(nq_self), msg->position.size()); ++i) {
@@ -364,10 +389,11 @@ private:
         }
 
         auto t_kin_start = std::chrono::high_resolution_clock::now();
-        // Complete kinematics for constraint generation
+        // Create Jacobian Matrix for the current safet joint position to become Cartesian velocities
         pinocchio::computeJointJacobians(model_self, data_self, q_safe);
         auto t_kin_end = std::chrono::high_resolution_clock::now();
 
+        // Copy position of other robot
         Eigen::VectorXd q_other_copy;
         bool other_robot_active = false;
         {
@@ -378,6 +404,7 @@ private:
             }
         }
 
+        // Shift obstacle position from the "world" coordinate relative to robot base
         Eigen::Vector3d obs_world;
         {
             std::lock_guard<std::mutex> lock(obs_mutex);
@@ -388,13 +415,15 @@ private:
         C_rows.clear();
         l_vals.clear();
         
+        // Optimize QP solver time by running collision math only when things are within 1.5m
         bool constraints_needed = false;
         if (!capsules_self.empty()) {
-            if (obs_local.norm()<1.5 || other_robot_active){
+            if (obs_local.norm()<1.0 || other_robot_active){
                 constraints_needed = true;
             }
         }
 
+        // If obstacle is far enough, then skip collision solver and do basic joint limit check
         if (!constraints_needed) {
             v_safe = v_des;
             for (int i=0; i<nv_self; ++i) {
@@ -403,10 +432,12 @@ private:
                 v_safe(i) = std::clamp(v_safe(i), v_min, v_max);
             }
             
+            // send clamped final safe velocity to robot
             std_msgs::msg::Float64MultiArray cmd;
             for(int i=0; i<7; ++i) cmd.data.push_back(v_safe[i]);
             pub_cmd->publish(cmd);
             
+            // Update safe position of the robot to ROS and RVIZ
             q_safe += v_safe * dt;
             sensor_msgs::msg::JointState msg_out;
             msg_out.header.stamp = now;
@@ -469,6 +500,7 @@ private:
                 }
             }
         }
+
         if (loop_count % 100 == 0) { 
             RCLCPP_INFO(get_logger(), 
                 "[%s] OBS DEBUG: World=[%.2f, %.2f] | Offset=[%.2f, %.2f] | Local=[%.2f, %.2f] | Closest Link='%s' Dist=%.3fm",
@@ -482,9 +514,9 @@ private:
         auto t_constr_end = std::chrono::high_resolution_clock::now();
 
         const int max_c = 60;
-        Eigen::MatrixXd C_t = Eigen::MatrixXd::Zero(max_c, nv_self);
-        Eigen::VectorXd l_t = Eigen::VectorXd::Constant(max_c, -1e20);
-        Eigen::VectorXd u_t = Eigen::VectorXd::Constant(max_c, 1e20);
+        Eigen::MatrixXd C_t = Eigen::MatrixXd::Zero(max_c, nv_self); //constraint
+        Eigen::VectorXd l_t = Eigen::VectorXd::Constant(max_c, -1e20); //lower limit
+        Eigen::VectorXd u_t = Eigen::VectorXd::Constant(max_c, 1e20); //upper limit 
 
         apply_limits(C_t, l_t, u_t, C_rows, l_vals, dt);
 
@@ -492,8 +524,8 @@ private:
 
         try {
             if (!solver_initialized) {
+                // QP Solver initialization 
                 qp = std::make_shared<proxsuite::proxqp::dense::QP<double>>(nv_self, 0, max_c);
-                
                 qp->settings.eps_abs = 1e-3;
                 qp->settings.eps_rel = 1e-3;
                 qp->settings.max_iter = 100;
@@ -502,19 +534,24 @@ private:
                 qp->settings.verbose = false;
                 qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
                 
+                // Goal: minimize difference between v_safe and v_des 
                 qp->init(Eigen::MatrixXd::Identity(nv_self, nv_self), -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
                 solver_initialized = true;
             } else {
+                // argument in order of (H, g, A, b, C, l, u)
+                // H: Hessian >> no value as goal didn't change
+                // Ax = b (Equality constraint) > no equality constraint so zero 
                 qp->update(std::nullopt, -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
             }
             
+            // Shafety Check and Execution 
             if (!C_t.allFinite()) { 
                 RCLCPP_ERROR(this->get_logger(), "NaN detected in Constraints!");
                 v_safe.setZero();
             } else {
                 qp->solve();
                 
-                // OPTIMIZATION 5: Timeout protection
+                // Timeout protection. If the solver doesn't answer within 10ms, stop the robot
                 auto qp_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::high_resolution_clock::now() - t_qp_start).count();
                 if (qp_dur > 10) {
@@ -542,6 +579,7 @@ private:
             RCLCPP_WARN(this->get_logger(), "TIMING: Total=%ld us | Kin=%ld | Cons=%ld | QP=%ld", d_tot, d_kin, d_con, d_qp);
         }
 
+        // Pulls joint values(not the fingers) and sent them to velocity controller 
         std_msgs::msg::Float64MultiArray cmd;
         for(int i=0; i<7; ++i) cmd.data.push_back(v_safe[i]);
         pub_cmd->publish(cmd);
@@ -593,9 +631,9 @@ private:
         
         // Apply Joint velocity limit
         for (int i=0; i<nv_self; ++i) {
-            if (row_idx >= C.rows()) break; // FIXED: C.rows()
+            if (row_idx >= C.rows()) break;
             
-            C(row_idx, i) = 1.0;            // FIXED: use row_idx, not 'r'
+            C(row_idx, i) = 1.0;
             
             double limit_l = std::max(-v_limit(i), (q_min(i) - q_safe(i)) / dt);
             double limit_u = std::min(v_limit(i), (q_max(i) - q_safe(i)) / dt);
@@ -605,8 +643,8 @@ private:
                 limit_l = mid - 1e-4;
                 limit_u = mid + 1e-4;
             }
-            L(row_idx) = limit_l;           // FIXED: use row_idx
-            U(row_idx) = limit_u;           // FIXED: use row_idx
+            L(row_idx) = limit_l;
+            U(row_idx) = limit_u;
             row_idx++;
         }
     }
