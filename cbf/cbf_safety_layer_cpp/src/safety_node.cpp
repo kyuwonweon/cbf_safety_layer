@@ -505,9 +505,19 @@ private:
 
             auto id_s = model_self.getFrameId(cap.start_frame);
             auto id_e = model_self.getFrameId(cap.end_frame);
+            Eigen::Vector3d p_s_raw = data_self.oMf[id_s].translation();
+            Eigen::Vector3d p_e_raw = data_self.oMf[id_e].translation();
             
-            Eigen::Vector3d p_s = data_self.oMf[id_s].translation();
-            Eigen::Vector3d p_e = data_self.oMf[id_e].translation();
+            Eigen::Vector3d p_s = p_s_raw;
+            Eigen::Vector3d p_e = p_e_raw;
+            Eigen::Vector3d dir = p_e_raw - p_s_raw;
+            
+            if (dir.norm() > 1e-4) {
+                dir.normalize();
+                double extension = 0.10; // The 10cm extension on both sides
+                p_s = p_s_raw - (dir * extension);
+                p_e = p_e_raw + (dir * extension);
+            }
             
             // Floor Constraint - only check if close
             if (p_e[2] < floor_height + 0.5) {
@@ -707,9 +717,7 @@ private:
         visualization_msgs::msg::Marker del; 
         del.action = visualization_msgs::msg::Marker::DELETEALL; 
         ma.markers.push_back(del);
-        
-        // FIX 1: Get the correct root frame name (e.g., robot1_fer_link0)
-        // We assume the first capsule's start frame (base -> link1) is the root
+
         std::string root_frame = "base";
         if (capsules_self.find("base") != capsules_self.end()) {
              root_frame = capsules_self["base"].start_frame; 
@@ -719,8 +727,19 @@ private:
         for(const auto& [name, cap] : capsules_self) {
             if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) continue;
             
-            Eigen::Vector3d p1 = data_self.oMf[model_self.getFrameId(cap.start_frame)].translation();
-            Eigen::Vector3d p2 = data_self.oMf[model_self.getFrameId(cap.end_frame)].translation();
+            Eigen::Vector3d p1_raw = data_self.oMf[model_self.getFrameId(cap.start_frame)].translation();
+            Eigen::Vector3d p2_raw = data_self.oMf[model_self.getFrameId(cap.end_frame)].translation();
+
+            Eigen::Vector3d p1 = p1_raw;
+            Eigen::Vector3d p2 = p2_raw;
+            Eigen::Vector3d dir = p2_raw - p1_raw;
+            
+            if (dir.norm() > 1e-4) {
+                dir.normalize();
+                double extension = 0.10; 
+                p1 = p1_raw - (dir * extension);
+                p2 = p2_raw + (dir * extension);
+            }
             
             visualization_msgs::msg::Marker m;
             m.header.frame_id = root_frame; 
