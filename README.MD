@@ -1,4 +1,5 @@
 **CBF Safety Layer for Franka Emika**
+
 A real-time Control Barrier Function (CBF) safety filter for Franka Emika robots in ROS 2. It uses Pinocchio for forward kinematics and ProxQP to solve a velocity-level Quadratic Program (QP). It prevents self-collisions, floor collisions, dynamic obstacle collisions, and inter-robot collisions.
 
 Dependencies
