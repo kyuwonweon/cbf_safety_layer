@@ -147,7 +147,7 @@ public:
         capsules_self["link1"]     = {s_pre + "link1", s_pre + "link2", 0.12};
         capsules_self["link2"]     = {s_pre + "link2", s_pre + "link3", 0.10};
         capsules_self["link3"]     = {s_pre + "link3", s_pre + "link4", 0.10};
-        capsules_self["link4"]     = {s_pre + "link4", s_pre + "link5", 0.10};
+        capsules_self["link4"]     = {s_pre + "link4", s_pre + "link5", 0.14};
         capsules_self["link5"]     = {s_pre + "link5", s_pre + "link6", 0.10};
         capsules_self["link6"]     = {s_pre + "link6", s_pre + "link7", 0.10};
         capsules_self["hand"]      = {s_pre + "link7", s_pre + "hand",  0.11};
@@ -157,7 +157,7 @@ public:
         capsules_other["link1"]     = {o_pre + "link1", o_pre + "link2", 0.12};
         capsules_other["link2"]     = {o_pre + "link2", o_pre + "link3", 0.10};
         capsules_other["link3"]     = {o_pre + "link3", o_pre + "link4", 0.10};
-        capsules_other["link4"]     = {o_pre + "link4", o_pre + "link5", 0.10};
+        capsules_other["link4"]     = {o_pre + "link4", o_pre + "link5", 0.14};
         capsules_other["link5"]     = {o_pre + "link5", o_pre + "link6", 0.10};
         capsules_other["link6"]     = {o_pre + "link6", o_pre + "link7", 0.10};
         capsules_other["hand"]      = {o_pre + "link7", o_pre + "hand",  0.11};
@@ -202,11 +202,8 @@ public:
         pub_obs_pose = create_publisher<geometry_msgs::msg::Point>("/shared_obstacle", 10);
         sub_obs_pose = create_subscription<geometry_msgs::msg::Point>("/shared_obstacle", 10,
         [this](const geometry_msgs::msg::Point::SharedPtr msg){
-            auto now = this->get_clock()->now();
-            if ((now - last_obs_update).seconds() < 0.05) return; // Debounce 50ms
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
-            last_obs_update = now;
         });
         
         // ------------------------------------------------------------------
@@ -317,16 +314,25 @@ private:
     }
 
     void process_obs_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr &feedback) {
-        if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
-            std::lock_guard<std::mutex> lock(obs_mutex);
-            obs_pose << feedback->pose.position.x, feedback->pose.position.y, feedback->pose.position.z;
-            
-            geometry_msgs::msg::Point p;
-            p.x = obs_pose(0); p.y = obs_pose(1); p.z = obs_pose(2);
-            pub_obs_pose->publish(p);
-            last_obs_update = this->get_clock()->now();
-        }
+        if (feedback->event_type != 
+        visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) return;
+
+    // Update obs_pose under lock, then release before publishing
+    {
+        std::lock_guard<std::mutex> lock(obs_mutex);
+        obs_pose << feedback->pose.position.x, 
+                    feedback->pose.position.y, 
+                    feedback->pose.position.z;
+        } // lock released here
+
+        // Publish outside the lock — no deadlock risk
+        geometry_msgs::msg::Point p;
+        p.x = feedback->pose.position.x;
+        p.y = feedback->pose.position.y;
+        p.z = feedback->pose.position.z;
+        pub_obs_pose->publish(p);
     }
+    
 
     void process_floor_feedback(const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr &feedback) {
         if (feedback->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
@@ -404,6 +410,36 @@ private:
             }
         }
 
+        if (other_robot_active) {
+            // 1. Run Forward Kinematics for Robot 2's specific joint angles
+            pinocchio::forwardKinematics(model_other, data_other, q_other_copy);
+            pinocchio::updateFramePlacements(model_other, data_other);
+
+            // 2. Find the frame ID for Robot 2's end-effector (the hand)
+            std::string o_pre = get_parameter("other_frame_prefix").as_string();
+            if (o_pre.empty()) o_pre = "fer_"; // Fallback just in case
+            std::string other_hand_frame = o_pre + "hand";
+
+            if (model_other.existFrame(other_hand_frame)) {
+                auto other_hand_id = model_other.getFrameId(other_hand_frame);
+                
+                // 3. Get position relative to Robot 2's own base (link0)
+                Eigen::Vector3d p_other_local = data_other.oMf[other_hand_id].translation();
+                
+                // 4. Shift to the global "base" frame
+                // In your launch file, Robot 2 is statically placed at [0, -1.0, 0]
+                Eigen::Vector3d other_base_in_world(0.0, -1.0, 0.0); 
+                Eigen::Vector3d p_other_world = p_other_local + other_base_in_world;
+
+                // 5. Print it to the terminal (Throttled to match your debug speed)
+                if (loop_count % 100 == 0) {
+                    RCLCPP_INFO(this->get_logger(), 
+                        "🤖 ROBOT 2 HAND in World: [X: %.3f, Y: %.3f, Z: %.3f]", 
+                        p_other_world(0), p_other_world(1), p_other_world(2));
+                }
+            }
+        }
+
         // Shift obstacle position from the "world" coordinate relative to robot base
         Eigen::Vector3d obs_world;
         {
@@ -418,7 +454,7 @@ private:
         // Optimize QP solver time by running collision math only when things are within 1.5m
         bool constraints_needed = false;
         if (!capsules_self.empty()) {
-            if (obs_local.norm()<1.0 || other_robot_active){
+            if (obs_local.norm()<1.5 || other_robot_active){
                 constraints_needed = true;
             }
         }
@@ -469,6 +505,7 @@ private:
 
             auto id_s = model_self.getFrameId(cap.start_frame);
             auto id_e = model_self.getFrameId(cap.end_frame);
+            
             Eigen::Vector3d p_s = data_self.oMf[id_s].translation();
             Eigen::Vector3d p_e = data_self.oMf[id_e].translation();
             
@@ -624,7 +661,7 @@ private:
         // Apply Obstacle constraint
         for (size_t i=0; i<Cr.size() && i<30; ++i) { 
             if (row_idx >= C.rows()) break;
-            C.row(row_idx) = Cr[i];     // FIXED: row_idx
+            C.row(row_idx) = Cr[i]; 
             L(row_idx) = std::clamp(Lr[i], -5.0, 5.0);
             row_idx++;
         }

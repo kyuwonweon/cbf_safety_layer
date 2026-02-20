@@ -3,6 +3,8 @@ import re
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.actions import TimerAction
+
 
 def generate_launch_description():
     urdf_file = os.path.join(
@@ -14,16 +16,28 @@ def generate_launch_description():
         robot_descrip = infp.read()
 
     def apply_namespace(desc, ns_prefix):
+        # rename all fer_ references
         pattern = r'=\s*(["\'])fer_'
-        return re.sub(pattern, f'=\\1{ns_prefix}fer_', desc)
+        result = re.sub(pattern, f'=\\1{ns_prefix}fer_', desc)
+        # remove the base_joint that connects base->link0 at origin
+        result = re.sub(
+            r'\s*<joint\s+name=["\'][^"\']*base_joint["\'][^>]*>.*?</joint>',
+            '',
+            result,
+            flags=re.DOTALL
+        )
+        # remove the <link name="base"/> stub that base_joint was attached
+        result = re.sub(
+            r'\s*<link\s+name=["\']base["\'][^/]*/?>(\s*</link>)?',
+            '',
+            result,
+            flags=re.DOTALL
+        )
+        return result
 
     # Apply the replacements
     robot1_r_descrip = apply_namespace(robot_descrip, "robot1_")
     robot2_r_descrip = apply_namespace(robot_descrip, "robot2_")
-    
-    # Save for debugging
-    with open('/tmp/debug_robot1_sledgehammer.xml', 'w') as f:
-        f.write(robot1_r_descrip)
 
     ready_pose_map = {
         'fer_joint1': 0.0,
@@ -40,7 +54,7 @@ def generate_launch_description():
     def get_ready_pose(prefix):
         return {f'{prefix}{k}': v for k, v in ready_pose_map.items()}
 
-    # ============= Robot 1 =============
+    # Robot1
     robot1_robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -99,7 +113,7 @@ def generate_launch_description():
         ]
     )
 
-    # ============= Robot 2 =============
+    # Robot2
     robot2_robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -158,6 +172,17 @@ def generate_launch_description():
         ]
     )
 
+    world_to_base = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='world_to_base_broadcaster',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--yaw', '0', '--pitch', '0', '--roll', '0',
+            '--frame-id', 'world', '--child-frame-id', 'base'
+        ]
+    )
+    
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -166,13 +191,20 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        world_to_base,
         robot1_tf,
-        robot1_robot_state_publisher,
-        robot1_joint_state_publisher,
-        robot1_safety_node,
         robot2_tf,
-        robot2_robot_state_publisher,
-        robot2_joint_state_publisher,
-        robot2_safety_node,
-        rviz_node
-    ])
+
+        TimerAction(
+            period=1.0,
+            actions=[
+                robot1_robot_state_publisher,
+                robot1_joint_state_publisher,
+                robot1_safety_node,
+                robot2_robot_state_publisher,
+                robot2_joint_state_publisher,
+                robot2_safety_node,
+                ]
+            ),
+        TimerAction(period=1.5, actions=[rviz_node]),
+        ])
