@@ -48,9 +48,6 @@ public:
         base_offset(1) = get_parameter("base_offset_y").as_double();
         base_offset(2) = get_parameter("base_offset_z").as_double();
 
-        RCLCPP_INFO(get_logger(), "Robot Base Offset: [%.2f, %.2f, %.2f]", 
-                    base_offset(0), base_offset(1), base_offset(2));
-
         std::string self_urdf, other_urdf;
         // Wait to ensure the urdf xml file is grabbed
         rclcpp::sleep_for(500ms); 
@@ -381,10 +378,8 @@ private:
         pinocchio::forwardKinematics(model_self, data_self, q_safe);
         pinocchio::updateFramePlacements(model_self, data_self);
         
-        // Publish markers at low frequency
-        if (++loop_count % 10 == 0) {
-            publish_markers();
-        }
+
+        publish_markers();
         
         if (dt < 0.001) return;
 
@@ -407,36 +402,6 @@ private:
             if (other_robot_detected) {
                 q_other_copy = q_other_robot;
                 other_robot_active = true;
-            }
-        }
-
-        if (other_robot_active) {
-            // 1. Run Forward Kinematics for Robot 2's specific joint angles
-            pinocchio::forwardKinematics(model_other, data_other, q_other_copy);
-            pinocchio::updateFramePlacements(model_other, data_other);
-
-            // 2. Find the frame ID for Robot 2's end-effector (the hand)
-            std::string o_pre = get_parameter("other_frame_prefix").as_string();
-            if (o_pre.empty()) o_pre = "fer_"; // Fallback just in case
-            std::string other_hand_frame = o_pre + "hand";
-
-            if (model_other.existFrame(other_hand_frame)) {
-                auto other_hand_id = model_other.getFrameId(other_hand_frame);
-                
-                // 3. Get position relative to Robot 2's own base (link0)
-                Eigen::Vector3d p_other_local = data_other.oMf[other_hand_id].translation();
-                
-                // 4. Shift to the global "base" frame
-                // In your launch file, Robot 2 is statically placed at [0, -1.0, 0]
-                Eigen::Vector3d other_base_in_world(0.0, -1.0, 0.0); 
-                Eigen::Vector3d p_other_world = p_other_local + other_base_in_world;
-
-                // 5. Print it to the terminal (Throttled to match your debug speed)
-                if (loop_count % 100 == 0) {
-                    RCLCPP_INFO(this->get_logger(), 
-                        "🤖 ROBOT 2 HAND in World: [X: %.3f, Y: %.3f, Z: %.3f]", 
-                        p_other_world(0), p_other_world(1), p_other_world(2));
-                }
             }
         }
 
@@ -548,15 +513,15 @@ private:
             }
         }
 
-        if (loop_count % 100 == 0) { 
-            RCLCPP_INFO(get_logger(), 
-                "[%s] OBS DEBUG: World=[%.2f, %.2f] | Offset=[%.2f, %.2f] | Local=[%.2f, %.2f] | Closest Link='%s' Dist=%.3fm",
-                get_namespace(),
-                obs_world(0), obs_world(1),
-                base_offset(0), base_offset(1),
-                obs_local(0), obs_local(1),
-                closest_link.c_str(), min_dist_found);
-        }
+        // if (loop_count % 100 == 0) { 
+        //     RCLCPP_INFO(get_logger(), 
+        //         "[%s] OBS DEBUG: World=[%.2f, %.2f] | Offset=[%.2f, %.2f] | Local=[%.2f, %.2f] | Closest Link='%s' Dist=%.3fm",
+        //         get_namespace(),
+        //         obs_world(0), obs_world(1),
+        //         base_offset(0), base_offset(1),
+        //         obs_local(0), obs_local(1),
+        //         closest_link.c_str(), min_dist_found);
+        // }
 
         auto t_constr_end = std::chrono::high_resolution_clock::now();
 
@@ -714,9 +679,6 @@ private:
 
     void publish_markers() {
         visualization_msgs::msg::MarkerArray ma;
-        visualization_msgs::msg::Marker del; 
-        del.action = visualization_msgs::msg::Marker::DELETEALL; 
-        ma.markers.push_back(del);
 
         std::string root_frame = "base";
         if (capsules_self.find("base") != capsules_self.end()) {
@@ -745,7 +707,9 @@ private:
             m.header.frame_id = root_frame; 
             m.header.stamp = this->get_clock()->now();
             m.id = id++; 
-            m.color.g = 1.0; m.color.a = 0.4; 
+            m.action = visualization_msgs::msg::Marker::ADD;
+            m.color.g = 1.0; 
+            m.color.a = 0.4; 
 
             double len = (p2 - p1).norm();
 
@@ -768,8 +732,10 @@ private:
                 
                 Eigen::Quaterniond q; 
                 q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), p2 - p1);
-                m.pose.orientation.w = q.w(); m.pose.orientation.x = q.x(); 
-                m.pose.orientation.y = q.y(); m.pose.orientation.z = q.z();
+                m.pose.orientation.w = q.w();
+                m.pose.orientation.x = q.x(); 
+                m.pose.orientation.y = q.y();
+                m.pose.orientation.z = q.z();
                 
                 m.scale.x = m.scale.y = cap.radius * 2.0; 
                 m.scale.z = len; 
