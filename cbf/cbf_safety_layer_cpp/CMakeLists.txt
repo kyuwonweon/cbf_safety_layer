@@ -54,6 +54,41 @@ install(TARGETS safety_node_cpp
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# =========================================================
+# BUILD RULES FOR SAFETY_NODE_ONE
+# =========================================================
+add_executable(safety_node_one src/safety_node_one.cpp)
+
+ament_target_dependencies(safety_node_one
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  geometry_msgs
+  interactive_markers
+  tf2_ros
+  tf2_eigen
+  ament_index_cpp
+  interactive_markers
+)
+
+target_link_libraries(safety_node_one
+  pinocchio::pinocchio
+  proxsuite::proxsuite
+)
+
+target_include_directories(safety_node_one PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${Eigen3_INCLUDE_DIRS}
+)
+
+# =========================================================
+# UPDATE THE INSTALL BLOCK (Replace your old install block with this)
+# =========================================================
+install(TARGETS safety_node_cpp safety_node_one
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )

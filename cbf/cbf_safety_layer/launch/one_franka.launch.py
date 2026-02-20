@@ -19,8 +19,8 @@ def generate_launch_description():
                              'franka.launch.py')
             ),
             launch_arguments={
-                'robot_ip': 'dont_care',
-                'use_fake_hardware': 'true',
+                'robot_ip': '192.168.51.20',
+                'use_fake_hardware': 'false',
                 'arm_id': 'fer',
                 'use_rviz': 'false',
             }.items(),
@@ -37,7 +37,7 @@ def generate_launch_description():
 
     safety_node = Node(
         package='cbf_safety_layer_cpp',
-        executable='safety_node_one',
+        executable='safety_node_cpp',
         output='screen',
         remappings=[
             ('/joint_states_source', '/joint_states_source'),
