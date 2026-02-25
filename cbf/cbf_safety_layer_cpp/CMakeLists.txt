@@ -21,8 +21,6 @@ find_package(interactive_markers REQUIRED)
 
 add_executable(safety_node_cpp src/safety_node.cpp)
 
-# --- FIX PART 1: Use ament_target_dependencies for ROS ---
-# This macro automatically finds the .hpp files AND the .so files
 ament_target_dependencies(safety_node_cpp
   rclcpp
   sensor_msgs
@@ -35,9 +33,6 @@ ament_target_dependencies(safety_node_cpp
   interactive_markers
 )
 
-# --- FIX PART 2: Manual Link for Math (NO "PUBLIC" KEYWORD) ---
-# We omit "PUBLIC" so this matches the style used by ament_target_dependencies.
-# This prevents the "mixed keyword signature" error.
 target_link_libraries(safety_node_cpp
   pinocchio::pinocchio
   proxsuite::proxsuite

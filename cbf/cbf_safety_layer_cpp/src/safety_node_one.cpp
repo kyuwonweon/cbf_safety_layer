@@ -12,6 +12,7 @@
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
+#include <pinocchio/algorithm/crba.hpp>
 #include <proxsuite/proxqp/dense/dense.hpp> 
 #include <optional> 
 #include <vector>
@@ -58,7 +59,6 @@ public:
         // Safety Buffer: Shrink limits slightly (5%) to prevent hitting hard-stops
         q_min_ *= 0.95; 
         q_max_ *= 0.95;
-        v_limit_ *= 0.10;
 
         q_safe_ = Eigen::VectorXd::Zero(nq_);
         v_safe_ = Eigen::VectorXd::Zero(nv_);
@@ -231,10 +231,15 @@ private:
         pinocchio::forwardKinematics(model_, data_, q_safe_);
         pinocchio::updateFramePlacements(model_, data_);
         pinocchio::computeJointJacobians(model_, data_, q_safe_);
+        pinocchio::crba(model_, data_, q_safe_); 
+        data_.M.triangularView<Eigen::StrictlyLower>() = data_.M.transpose().triangularView<Eigen::StrictlyLower>(); // Make symmetricr
 
         // Constraint Generation
         std::vector<Eigen::MatrixXd> C_rows;
         std::vector<double> l_vals, u_vals;
+        double gamma = 2.0;
+        double ke = (0.5*v_safe_.transpose() * data_.M * v_safe_).value();
+        Eigen::RowVectorXd C_energy = v_safe_.transpose() * data_.M;
 
         for (const auto& [name, capsule] : capsules_) {
             if (!model_.existFrame(capsule.end_frame) || !model_.existFrame(capsule.start_frame)) continue;
@@ -270,9 +275,27 @@ private:
                     Eigen::Vector3d lever = p_e - p_frame_end;
                     Eigen::MatrixXd J_tip = J_end.topRows(3) - skew(lever) * J_end.bottomRows(3);
 
-                    C_rows.push_back(J_tip.row(2)); 
-                    l_vals.push_back(-alpha_ * std::max(h_floor, 0.001)); 
-                    u_vals.push_back(1e20); 
+                    //Energy Cbf math 
+                    double h_dot_floor = std::max(J_tip.row(2).dot(v_safe_), -0.05);
+                    double B_floor = (gamma*h_floor) - ke;
+                    double u_floor = (gamma*h_dot_floor)+(alpha_*B_floor);
+
+                    if (h_floor < 0) {
+                         u_floor += 5.0 * std::abs(h_floor); 
+                    }
+
+                    C_rows.push_back(C_energy); 
+                    l_vals.push_back(-1e20); 
+                    u_vals.push_back(u_floor); 
+
+                    Eigen::RowVectorXd C_kin_floor = J_tip.row(2);
+                    double kp = 20.0;
+                    double kd = 5.0;
+                    double l_kin_floor = std::clamp(-kp*h_floor - kd*h_dot_floor, -10.0, 10.0);
+
+                    C_rows.push_back(C_kin_floor);
+                    l_vals.push_back(l_kin_floor);
+                    u_vals.push_back(1e20);
                 }
             }
 
@@ -285,8 +308,27 @@ private:
                 pinocchio::getFrameJacobian(model_, data_, id_start, pinocchio::LOCAL_WORLD_ALIGNED, J_start);
                 Eigen::Vector3d lever = res.first - p_frame_start;
                 Eigen::MatrixXd J_point = J_start.topRows(3) - skew(lever) * J_start.bottomRows(3);
-                C_rows.push_back(n.transpose() * J_point);
-                l_vals.push_back(-alpha_ * std::max(h_obs, 0.001));
+
+                Eigen::RowVectorXd J_obs = n.transpose()*J_point;
+                double h_dot_obs = std::max(J_obs.dot(v_safe_), -0.05);
+                double b_obs =  gamma*h_obs - ke;
+                double u_obs = gamma*h_dot_obs + alpha_*b_obs;
+
+                if (h_obs < 0) {
+                     u_obs += 5.0 * std::abs(h_obs); 
+                }
+
+                C_rows.push_back(C_energy);
+                l_vals.push_back(-1e20);
+                u_vals.push_back(u_obs);
+
+                Eigen::RowVectorXd C_kin_obs = J_obs;
+                double kp = 20.0;
+                double kd = 5.0;
+                double l_kin_obs = std::clamp(-kp * h_obs - kd*h_dot_obs, -10.0, 10.0);// Uses true negative distance
+
+                C_rows.push_back(C_kin_obs);
+                l_vals.push_back(l_kin_obs);
                 u_vals.push_back(1e20);
             }
         }
@@ -299,8 +341,10 @@ private:
 
         applyJointLimits(C_total, l_total, u_total, C_rows, l_vals, u_vals, dt);
 
+        double Kp = 10.0;
+        Eigen::VectorXd a_des = Kp*(v_user_command_ - v_safe_);
         Eigen::MatrixXd H = Eigen::MatrixXd::Identity(nv_, nv_);
-        Eigen::VectorXd g = -v_des;
+        Eigen::VectorXd g = -a_des;
         Eigen::MatrixXd A_eq(0, nv_); Eigen::VectorXd b_eq(0);
 
         try {
@@ -313,8 +357,13 @@ private:
                 qp_->update(H, g, A_eq, b_eq, C_total, l_total, u_total);
             }
             qp_->solve();
+
             if (qp_->results.info.status == proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
-                v_safe_ = qp_->results.x;
+                Eigen::VectorXd a_safe = qp_ -> results.x;
+                v_safe_ += a_safe*dt;
+                for(int i=0; i<nv_; ++i) {
+                    v_safe_(i) = std::clamp(v_safe_(i), -v_limit_(i), v_limit_(i));
+                }
             } else {
                 v_safe_.setZero();
             }
@@ -446,14 +495,23 @@ private:
             u_total(i) = u_obs[i];
         }
 
+        double a_max = 15.0;  //Max absolute acceleration for physical hardware
+
         // Joint and velocity limits
         for (int i = 0; i < nv_; ++i) {
             int row = num_obs + i;
-            C_total(row, i) = 1.0;
-            double v_to_min = (q_min_(i) - q_safe_(i)) / dt;
-            double v_to_max = (q_max_(i) - q_safe_(i)) / dt;
-            l_total(row) = std::max(-v_limit_(i), v_to_min);
-            u_total(row) = std::min(v_limit_(i), v_to_max);
+            C_total(row, i) = 1.0;// Convert max velocity to an acceleration bound
+
+            double a_v_max = (v_limit_(i) - v_safe_(i)) / dt;
+            double a_v_min = (-v_limit_(i) - v_safe_(i)) / dt;
+            
+            // Convert max position to an acceleration bound
+            double a_q_max = (q_max_(i) - q_safe_(i) - (v_safe_(i) * dt)) / (dt * dt);
+            double a_q_min = (q_min_(i) - q_safe_(i) - (v_safe_(i) * dt)) / (dt * dt);
+            
+            // The allowable acceleration is the most restrictive of the three
+            l_total(row) = std::max({-a_max, a_v_min, a_q_min});
+            u_total(row) = std::min({a_max, a_v_max, a_q_max});
         }
     }
 
