@@ -18,6 +18,7 @@
   <depend>pinocchio</depend>
   <depend>proxsuite</depend>
   <depend>tf2_eigen</depend>
+  <depend>libfranka</depend>
   <depend>ament_index_cpp</depend>
   <depend>eigen</depend>
   <test_depend>ament_lint_auto</test_depend>

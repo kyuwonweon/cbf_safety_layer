@@ -1,10 +1,10 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, GroupAction
+from launch.actions import IncludeLaunchDescription, GroupAction, RegisterEventHandler # Added RegisterEventHandler
+from launch.event_handlers import OnProcessExit # Added OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node, SetRemap
-
 
 def generate_launch_description():
     franka_sim = GroupAction([
@@ -21,11 +21,19 @@ def generate_launch_description():
             launch_arguments={
                 'robot_ip': '192.168.51.20',
                 'use_fake_hardware': 'false',
+                'robot_type': 'fer',
                 'arm_id': 'fer',
+                'load_gripper': 'false',
                 'use_rviz': 'false',
             }.items(),
         )
     ])
+
+    spawn_broadcaster = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=['franka_robot_state_broadcaster', '--controller-manager', '/controller_manager'],
+    )
 
     spawn_velocity = Node(
         package="controller_manager",
@@ -35,12 +43,19 @@ def generate_launch_description():
                    os.path.join(get_package_share_directory('cbf_safety_layer'),'config', 'controllers.yaml')],
     )
 
+    # Fixed variable name here: target_action=spawn_broadcaster, on_exit=[spawn_velocity]
+    delayed_velocity_spawner = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=spawn_broadcaster,
+            on_exit=[spawn_velocity],
+        )
+    )
+
     safety_node = Node(
         package='cbf_safety_layer_cpp',
-        executable='safety_node_cpp',
+        executable='safety_node_one',
         output='screen',
         remappings=[
-            ('/joint_states_source', '/joint_states_source'),
             ('/safety/joint_states', '/joint_states'),
         ]
     )
@@ -69,10 +84,17 @@ def generate_launch_description():
 
     joy_node = Node(package='joy', executable='joy_node')
     teleop_node = Node(package='cbf_safety_layer', executable='teleop_node')
-
+    # teleop_node = Node(
+    #     package='cbf_safety_layer', 
+    #     executable='teleop_node',
+    #     remappings=[
+    #         ('/safety/input_joint_states', '/velocity_group_controller/commands'),
+    #     ]
+    # )
     return LaunchDescription([
         franka_sim,
-        spawn_velocity,
+        spawn_broadcaster,
+        delayed_velocity_spawner,
         safety_node,
         robot_state_publisher,
         rviz_node,

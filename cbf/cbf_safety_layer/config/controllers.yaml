@@ -1,6 +1,12 @@
-controller_manager:
+/**:
   ros__parameters:
-    update_rate: 1000  # 1kHz loop
+    update_rate: 500
+
+    franka_robot_state_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+    velocity_group_controller:
+      type: velocity_controllers/JointGroupVelocityController
 
 velocity_group_controller:
   ros__parameters:
