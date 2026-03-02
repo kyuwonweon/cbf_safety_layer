@@ -5,6 +5,7 @@
 #include <interactive_markers/interactive_marker_server.hpp> 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <Eigen/Dense>
 #include <pinocchio/multibody/model.hpp>
@@ -108,6 +109,9 @@ public:
         RCLCPP_INFO(get_logger(), "Self Robot Loaded: nq=%d, nv=%d", nq_self, nv_self);
         RCLCPP_INFO(get_logger(), "Other Robot Loaded: nq=%d, nv=%d", nq_other, nv_other);
 
+        // bool to turn on and of cbf 
+        cbf_on = true;
+
         // Initialize vectors
         q_min = Eigen::VectorXd(nv_self);
         q_max = Eigen::VectorXd(nv_self);
@@ -128,6 +132,7 @@ public:
         q_other_robot = Eigen::VectorXd::Zero(nq_other);
         v_safe = Eigen::VectorXd::Zero(nv_self);
         v_user_command = Eigen::VectorXd::Zero(nv_self);
+        v_other_robot = Eigen::VectorXd::Zero(nv_other);
 
         // -------------------------------------------------------
         // Setup Geometric primitve to encapsulate robot 
@@ -208,6 +213,17 @@ public:
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
         });
+
+        sub_cbf_toggle = create_subscription<std_msgs::msg::Bool>("cbf_toggle", qos, 
+        [this](const std_msgs::msg::Bool::SharedPtr msg){
+            cbf_on = msg -> data; 
+            if (cbf_on){
+                RCLCPP_INFO(get_logger(), "CBF Safety Layer is activated");
+            }
+            else{
+                RCLCPP_INFO(get_logger(), "CBF Safety Layer is not active.");
+            }
+        });
         
         // ------------------------------------------------------------------
         // Marker for Obstacle showing 
@@ -227,6 +243,7 @@ public:
 private:
     pinocchio::Model model_self, model_other;
     pinocchio::Data data_self, data_other;
+    bool cbf_on;
     int nq_self, nv_self, nq_other, nv_other;
     int loop_count = 0;
     rclcpp::Time last_viz_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
@@ -254,6 +271,7 @@ private:
     std::mutex cmd_mutex;
     std::mutex obs_mutex;
 
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cbf_toggle;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_input_vel;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
@@ -351,7 +369,7 @@ private:
             q_other_robot[i] = msg->position[i];
         }
         for (size_t i=0; i < std::min(static_cast<size_t>(nv_other), msg->velocity.size()); ++i){
-            q_other_robot[i] = msg -> velocity[i];
+            v_other_robot[i] = msg -> velocity[i];
         }
         if (!other_robot_detected) {
             other_robot_detected = true;
@@ -416,9 +434,9 @@ private:
         }
 
         if (other_robot_active){
-            pinocchio::forwardKinematics(model_self, data_self, q_safe);
-            pinocchio::updateFramePlacements(model_self, data_self);
-            pinocchio::computeJointJacobians(model_self, data_self, q_safe);
+            pinocchio::forwardKinematics(model_other, data_other, q_other_copy);
+            pinocchio::updateFramePlacements(model_other, data_other);
+            pinocchio::computeJointJacobians(model_other, data_other, q_other_copy);
         }
 
         // Shift obstacle position from the "world" coordinate relative to robot base
@@ -477,6 +495,7 @@ private:
                     pinocchio::getFrameJacobian(model_self, data_self, id_e, pinocchio::LOCAL_WORLD_ALIGNED, J_e);
                     C_rows.push_back(J_e.row(2));
                     l_vals.push_back(-alpha * std::max(h_f, 0.001));
+                    u_vals.push_back(1e20);
                 }
             }
 
@@ -574,14 +593,76 @@ private:
                     }           
                 }
             }
+        
+        // --- Self-Collision Constraint (Dodging its own body) ---
+            for (const auto& [name_, cap_] : capsules_self) {
+                // Prevent duplicate checks
+                if (name >= name_) continue;
+
+                // 1. ACM (Allowed Collision Matrix) Logic:
+                // Skip adjacent links AND links separated by only 1 joint.
+                // (Physical hardware limits prevent them from touching anyway)
+                auto get_idx = [](const std::string& n) {
+                    if (n == "base") return 0;
+                    if (n == "hand") return 7;
+                    if (n.size() > 4 && n.substr(0,4) == "link") return n[4] - '0';
+                    return 99; // Fallback
+                };
+                if (std::abs(get_idx(name) - get_idx(name_)) <= 3) continue;
+
+                auto id_s2 = model_self.getFrameId(cap_.start_frame);
+                auto id_e2 = model_self.getFrameId(cap_.end_frame);
+                Eigen::Vector3d p_s2_raw = data_self.oMf[id_s2].translation();
+                Eigen::Vector3d p_e2_raw = data_self.oMf[id_e2].translation();
+                
+                // 2. Use RAW skeleton points (No 10cm artificial padding!)
+                auto [pt1, pt2] = closest_segments_points(p_s_raw, p_e_raw, p_s2_raw, p_e2_raw);
+                double dist = (pt1 - pt2).norm();
+                double h_self = dist - (cap.radius + cap_.radius + safety_margin);
+
+                // If the arm is folding into a 3cm danger zone with its own body
+                if (dist < 0.5 && h_self < 0.03) {
+                    if (h_self < 0.0) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                            "SELF-COLLISION DETECTED: [%s] is crushing [%s] by %f meters!", 
+                            name.c_str(), name_.c_str(), std::abs(h_self));
+                    }
+                    Eigen::Vector3d n = (dist > 1e-5) ? ((pt1 - pt2) / dist) : Eigen::Vector3d(1,0,0);
+                    
+                    Eigen::MatrixXd J1(6, nv_self); J1.setZero();
+                    pinocchio::getFrameJacobian(model_self, data_self, id_s, pinocchio::LOCAL_WORLD_ALIGNED, J1);
+                    Eigen::MatrixXd J1_pt = J1.topRows(3) - skew(pt1 - p_s_raw) * J1.bottomRows(3);
+                    
+                    Eigen::MatrixXd J2(6, nv_self); J2.setZero();
+                    pinocchio::getFrameJacobian(model_self, data_self, id_s2, pinocchio::LOCAL_WORLD_ALIGNED, J2);
+                    Eigen::MatrixXd J2_pt = J2.topRows(3) - skew(pt2 - p_s2_raw) * J2.bottomRows(3);
+                    
+                    Eigen::RowVectorXd J_self_rel = n.transpose() * (J1_pt - J2_pt);
+                    double h_dot_self = J_self_rel.dot(v_safe);
+
+                    double kp = 20.0, kd = 5.0;
+                    double l_kin = std::clamp(-kp * h_self - kd * h_dot_self, -2.0, 2.0);
+                    
+                    C_rows.push_back(J_self_rel);
+                    l_vals.push_back(l_kin);
+                    u_vals.push_back(1e20);
+                }
+            }
+
         }
+        
         auto t_constr_end = std::chrono::high_resolution_clock::now();
 
-        const int max_c = 100;
+        const int max_c = 150;
         Eigen::MatrixXd C_t = Eigen::MatrixXd::Zero(max_c, nv_self); //constraint
         Eigen::VectorXd l_t = Eigen::VectorXd::Constant(max_c, -1e20); //lower limit
         Eigen::VectorXd u_t = Eigen::VectorXd::Constant(max_c, 1e20); //upper limit 
 
+        if (!cbf_on){
+            C_rows.clear();
+            l_vals.clear();
+            u_vals.clear();
+        }
         apply_limits(C_t, l_t, u_t, C_rows, l_vals, u_vals, dt);
 
         auto t_qp_start = std::chrono::high_resolution_clock::now();
@@ -600,7 +681,7 @@ private:
                 qp->settings.max_iter_in = 10;
                 qp->settings.check_duality_gap = false;
                 qp->settings.verbose = false;
-                qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
+                //qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
                 
                 // Goal: minimize difference between v_safe and v_des 
                 qp->init(H, -a_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
