@@ -5,6 +5,7 @@
 #include <interactive_markers/interactive_marker_server.hpp> 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <Eigen/Dense>
 #include <pinocchio/multibody/model.hpp>
@@ -13,10 +14,12 @@
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
+#include <pinocchio/algorithm/crba.hpp>
 #include <proxsuite/proxqp/dense/dense.hpp> 
 #include <optional> 
 #include <vector>
 #include <mutex>
+#include <algorithm>
 
 using namespace std::chrono_literals;
 
@@ -41,12 +44,19 @@ public:
         declare_parameter("base_offset_x", 0.0);
         declare_parameter("base_offset_y", 0.0);
         declare_parameter("base_offset_z", 0.0);
+        declare_parameter("other_base_offset_x", 0.0);
+        declare_parameter("other_base_offset_y", 0.0);
+        declare_parameter("other_base_offset_z", 0.0);
         base_offset = Eigen::Vector3d::Zero();
 
         // get robot offsets from the "base" frame for rivz
         base_offset(0) = get_parameter("base_offset_x").as_double();
         base_offset(1) = get_parameter("base_offset_y").as_double();
         base_offset(2) = get_parameter("base_offset_z").as_double();
+        other_base_offset(0) = get_parameter("other_base_offset_x").as_double();
+        other_base_offset(1) = get_parameter("other_base_offset_y").as_double();
+        other_base_offset(2) = get_parameter("other_base_offset_z").as_double();
+
 
         std::string self_urdf, other_urdf;
         // Wait to ensure the urdf xml file is grabbed
@@ -99,6 +109,9 @@ public:
         RCLCPP_INFO(get_logger(), "Self Robot Loaded: nq=%d, nv=%d", nq_self, nv_self);
         RCLCPP_INFO(get_logger(), "Other Robot Loaded: nq=%d, nv=%d", nq_other, nv_other);
 
+        // bool to turn on and of cbf 
+        cbf_on = true;
+
         // Initialize vectors
         q_min = Eigen::VectorXd(nv_self);
         q_max = Eigen::VectorXd(nv_self);
@@ -113,13 +126,13 @@ public:
         double padding = 0.02; 
         q_min = q_min.array() + padding;
         q_max = q_max.array() - padding;
-        v_limit *= 0.95;
 
         // Setup empty vectors to hold safe and commanded velocity output
         q_safe = Eigen::VectorXd::Zero(nq_self);
         q_other_robot = Eigen::VectorXd::Zero(nq_other);
         v_safe = Eigen::VectorXd::Zero(nv_self);
         v_user_command = Eigen::VectorXd::Zero(nv_self);
+        v_other_robot = Eigen::VectorXd::Zero(nv_other);
 
         // -------------------------------------------------------
         // Setup Geometric primitve to encapsulate robot 
@@ -180,14 +193,13 @@ public:
         
         sub_js_other = create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states_source_other", qos, std::bind(&SafetyNode::joint_cb_other, this, std::placeholders::_1));
-        
-        // 
-        pub_safe = create_publisher<sensor_msgs::msg::JointState>("/safety/joint_states", qos);
+
+        pub_safe = create_publisher<sensor_msgs::msg::JointState>("safety/joint_states", qos);
         pub_marker = create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
         pub_cmd = create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
 
         sub_input_vel = create_subscription<sensor_msgs::msg::JointState>(
-            "/safety/input_joint_states", 10, 
+            "safety/input_joint_states", 10, 
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(cmd_mutex);
                 if (msg->velocity.size() == static_cast<size_t>(nv_self)) {
@@ -195,12 +207,22 @@ public:
                 }
             });
 
-        
         pub_obs_pose = create_publisher<geometry_msgs::msg::Point>("/shared_obstacle", 10);
         sub_obs_pose = create_subscription<geometry_msgs::msg::Point>("/shared_obstacle", 10,
         [this](const geometry_msgs::msg::Point::SharedPtr msg){
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
+        });
+
+        sub_cbf_toggle = create_subscription<std_msgs::msg::Bool>("cbf_toggle", qos, 
+        [this](const std_msgs::msg::Bool::SharedPtr msg){
+            cbf_on = msg -> data; 
+            if (cbf_on){
+                RCLCPP_INFO(get_logger(), "CBF Safety Layer is activated");
+            }
+            else{
+                RCLCPP_INFO(get_logger(), "CBF Safety Layer is not active.");
+            }
         });
         
         // ------------------------------------------------------------------
@@ -221,18 +243,21 @@ public:
 private:
     pinocchio::Model model_self, model_other;
     pinocchio::Data data_self, data_other;
+    bool cbf_on;
     int nq_self, nv_self, nq_other, nv_other;
     int loop_count = 0;
     rclcpp::Time last_viz_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
     rclcpp::Time last_obs_update = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
-    Eigen::Vector3d base_offset;
+    Eigen::Vector3d base_offset, other_base_offset;
     std::vector<std::string> joint_names;
     std::vector<Eigen::MatrixXd> C_rows;
     std::vector<double> l_vals;
+    std::vector<double> u_vals;
     
-    Eigen::VectorXd q_safe, v_safe, v_user_command, q_min, q_max, v_limit, q_other_robot;
-    Eigen::Vector3d obs_pose = {0.8, 0.0, 0.4}; 
+    Eigen::VectorXd q_safe, v_safe, v_user_command, q_min, q_max, v_limit;
+    Eigen::VectorXd q_other_robot, v_other_robot;
+    Eigen::Vector3d obs_pose = {0.6, 0.0, 0.4}; 
     double obs_radius = 0.10, safety_margin = 0.02, alpha = 5.0, floor_height = 0.0;
     bool first_run = true, solver_initialized = false, other_robot_detected = false;
     rclcpp::Time last_time;
@@ -246,6 +271,7 @@ private:
     std::mutex cmd_mutex;
     std::mutex obs_mutex;
 
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cbf_toggle;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_input_vel;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
@@ -342,6 +368,9 @@ private:
         for (size_t i = 0; i < std::min(static_cast<size_t>(nq_other), msg->position.size()); ++i) {
             q_other_robot[i] = msg->position[i];
         }
+        for (size_t i=0; i < std::min(static_cast<size_t>(nv_other), msg->velocity.size()); ++i){
+            v_other_robot[i] = msg -> velocity[i];
+        }
         if (!other_robot_detected) {
             other_robot_detected = true;
             RCLCPP_INFO(this->get_logger(), "Other robot detected - enabling inter-robot collision avoidance");
@@ -377,10 +406,13 @@ private:
         // Update Kinematics 
         pinocchio::forwardKinematics(model_self, data_self, q_safe);
         pinocchio::updateFramePlacements(model_self, data_self);
-        
+        auto t_kin_start = std::chrono::high_resolution_clock::now();
+        // Create Jacobian Matrix for the current safet joint position to become Cartesian velocities
+        pinocchio::computeJointJacobians(model_self, data_self, q_safe);
+        auto t_kin_end = std::chrono::high_resolution_clock::now();
+        pinocchio::crba(model_self, data_self, q_safe);
+        data_self.M.triangularView<Eigen::StrictlyLower>() = data_self.M.transpose().triangularView<Eigen::StrictlyLower>();
 
-        publish_markers();
-        
         if (dt < 0.001) return;
 
         Eigen::VectorXd v_des;
@@ -389,20 +421,22 @@ private:
             v_des = v_user_command.cwiseMin(2.0).cwiseMax(-2.0);
         }
 
-        auto t_kin_start = std::chrono::high_resolution_clock::now();
-        // Create Jacobian Matrix for the current safet joint position to become Cartesian velocities
-        pinocchio::computeJointJacobians(model_self, data_self, q_safe);
-        auto t_kin_end = std::chrono::high_resolution_clock::now();
-
         // Copy position of other robot
-        Eigen::VectorXd q_other_copy;
+        Eigen::VectorXd q_other_copy, v_other_copy;
         bool other_robot_active = false;
         {
             std::lock_guard<std::mutex> lock(q_other_mutex);
             if (other_robot_detected) {
                 q_other_copy = q_other_robot;
+                v_other_copy = v_other_robot;
                 other_robot_active = true;
             }
+        }
+
+        if (other_robot_active){
+            pinocchio::forwardKinematics(model_other, data_other, q_other_copy);
+            pinocchio::updateFramePlacements(model_other, data_other);
+            pinocchio::computeJointJacobians(model_other, data_other, q_other_copy);
         }
 
         // Shift obstacle position from the "world" coordinate relative to robot base
@@ -415,43 +449,12 @@ private:
 
         C_rows.clear();
         l_vals.clear();
-        
-        // Optimize QP solver time by running collision math only when things are within 1.5m
-        bool constraints_needed = false;
-        if (!capsules_self.empty()) {
-            if (obs_local.norm()<1.5 || other_robot_active){
-                constraints_needed = true;
-            }
-        }
+        u_vals.clear();
 
-        // If obstacle is far enough, then skip collision solver and do basic joint limit check
-        if (!constraints_needed) {
-            v_safe = v_des;
-            for (int i=0; i<nv_self; ++i) {
-                double v_min = std::max(-v_limit(i), (q_min(i) - q_safe(i)) / dt);
-                double v_max = std::min(v_limit(i), (q_max(i) - q_safe(i)) / dt);
-                v_safe(i) = std::clamp(v_safe(i), v_min, v_max);
-            }
-            
-            // send clamped final safe velocity to robot
-            std_msgs::msg::Float64MultiArray cmd;
-            for(int i=0; i<7; ++i) cmd.data.push_back(v_safe[i]);
-            pub_cmd->publish(cmd);
-            
-            // Update safe position of the robot to ROS and RVIZ
-            q_safe += v_safe * dt;
-            sensor_msgs::msg::JointState msg_out;
-            msg_out.header.stamp = now;
-            msg_out.header.frame_id = "base";
-            msg_out.name = joint_names;
-            msg_out.position.resize(nq_self); 
-            msg_out.velocity.resize(nv_self);
-            for(int i=0; i<nq_self; ++i) msg_out.position[i] = q_safe[i];
-            for(int i=0; i<nv_self; ++i) msg_out.velocity[i] = v_safe[i];
-            pub_safe->publish(msg_out);
-            
-            return; 
-        }
+        // Energy Calculation 
+        double ke = (0.5*v_safe.transpose()*data_self.M*v_safe).value();
+        Eigen::RowVectorXd c_energy = v_safe.transpose()*data_self.M;
+        double gamma = 2.0;
 
         //debug
         double min_dist_found = 100.0;
@@ -492,47 +495,181 @@ private:
                     pinocchio::getFrameJacobian(model_self, data_self, id_e, pinocchio::LOCAL_WORLD_ALIGNED, J_e);
                     C_rows.push_back(J_e.row(2));
                     l_vals.push_back(-alpha * std::max(h_f, 0.001));
+                    u_vals.push_back(1e20);
                 }
             }
 
             // Obstacle Constraint - only if close
             auto pt = closest_point_on_seg(p_s, p_e, obs_local);
-            double d_p = (pt - obs_local).norm();
-            double surface_dist = d_p - cap.radius - obs_radius;
+            double d_p = (pt - obs_local).norm(); //center to center distance between obs and robot link
+            if (d_p<0.3){
+                double h_obs = d_p - cap.radius - obs_radius - safety_margin;
+                if (h_obs<0.2){
+                    Eigen::Vector3d n = (d_p>1e-6)? ((pt-obs_local)/d_p) : Eigen::Vector3d(1,0,0);
+                    Eigen::MatrixXd J_s(6, nv_self);
+                    J_s.setZero();
+                    pinocchio::getFrameJacobian(model_self, data_self, id_s, pinocchio::LOCAL_WORLD_ALIGNED, J_s);
+                    Eigen::MatrixXd J_pt = J_s.topRows(3) - skew(pt-p_s_raw)*J_s.bottomRows(3);
 
-            if (surface_dist<min_dist_found){
-                min_dist_found = surface_dist;
-                closest_link = name;
-            }
+                    Eigen::RowVectorXd J_obs = n.transpose()*J_pt;
+                    double h_dot_obs = J_obs.dot(v_safe);
 
-            if (d_p < 0.5) {
-                double h_p = d_p - (cap.radius + obs_radius + safety_margin);
-                if (h_p < 0.25) {
-                    add_constraint(C_rows, l_vals, pt, obs_local, d_p, h_p, id_s, p_s);
+                    //Energy CBF
+                    double h_safe = std::max(h_obs,-0.05);
+                    double b_obs = (gamma*h_safe)-ke;
+                    double u_obs = (gamma * h_dot_obs) + (alpha * b_obs);
+                    if (h_obs < 0) u_obs += 5.0 * std::abs(h_obs);
+                    if (v_safe.norm() > 0.01) {
+                        C_rows.push_back(c_energy);
+                        l_vals.push_back(-1e20);
+                        u_vals.push_back(u_obs);
+                    }
+
+                    double kp = 20.0;
+                    double kd = 5.0;
+                    double l_kin = std::clamp(-kp * h_obs - kd * h_dot_obs, -10.0, 10.0);
+                    C_rows.push_back(J_obs);
+                    l_vals.push_back(l_kin);
+                    u_vals.push_back(1e20);
                 }
             }
+
+            // Robot to Robot Constraint (Relative Jacobian)
+            if (other_robot_active){
+                for (const auto& [name_, cap_]:capsules_other){
+                    if (!model_other.existFrame(cap_.start_frame) || !model_other.existFrame(cap_.end_frame)) continue;
+                    auto id_start = model_other.getFrameId(cap_.start_frame);
+                    auto id_end = model_other.getFrameId(cap_.end_frame);
+
+                    Eigen::Vector3d start_point = data_other.oMf[id_start].translation()+other_base_offset-base_offset;
+                    Eigen::Vector3d end_point = data_other.oMf[id_end].translation()+other_base_offset-base_offset;
+                    Eigen::Vector3d dir_ = end_point - start_point;
+                    if (dir_.norm()>1e-4){
+                        dir_.normalize();
+                        start_point -= dir_*0.1;
+                        end_point += dir_*0.1;
+                    }
+                    auto [pt_start, pt_end] = closest_segments_points(p_s, p_e, start_point, end_point);
+                    double dist = (pt_start - pt_end).norm();
+                    double h_dyn = dist - (cap.radius + cap_.radius + safety_margin);
+
+                    if (dist < 0.6 && h_dyn < 0.3) {
+                        Eigen::Vector3d n = (dist > 1e-5) ? ((pt_start - pt_end) / dist) : Eigen::Vector3d(1,0,0);
+                        
+                        // Self Jacobian
+                        Eigen::MatrixXd J_s(6, nv_self); 
+                        J_s.setZero();
+                        pinocchio::getFrameJacobian(model_self, data_self, id_s, pinocchio::LOCAL_WORLD_ALIGNED, J_s);
+                        Eigen::MatrixXd J_s_pt = J_s.topRows(3) - skew(pt_start - p_s_raw) * J_s.bottomRows(3);
+                        Eigen::RowVectorXd J_rel = n.transpose() * J_s_pt;
+
+                        // Other Jacobian
+                        Eigen::MatrixXd J_o(6, nv_other); J_o.setZero();
+                        pinocchio::getFrameJacobian(model_other, data_other, id_start, pinocchio::LOCAL_WORLD_ALIGNED, J_o);
+                        Eigen::Vector3d pt_other_local = pt_end + base_offset - other_base_offset;
+                        Eigen::MatrixXd J_o_pt = J_o.topRows(3) - skew(pt_other_local- data_other.oMf[id_start].translation()) * J_o.bottomRows(3);
+
+                        // Relative velocity injection
+                        Eigen::Vector3d v_obs_vec = J_o_pt * v_other_copy;
+                        double v_obs_proj = n.dot(v_obs_vec); 
+                        double h_dot_dyn = J_rel.dot(v_safe) - v_obs_proj;
+
+                        // Energy CBF
+                        double h_dyn_safe = std::max(h_dyn, -0.05);
+                        double b_dyn = (gamma * h_dyn_safe) - ke;
+                        double u_dyn = (gamma * h_dot_dyn) + (alpha * b_dyn);
+                        if (h_dyn < 0) u_dyn += 5.0 * std::abs(h_dyn);
+                        if (v_safe.norm() > 0.01) {
+                            C_rows.push_back(c_energy);
+                            l_vals.push_back(-1e20);
+                            u_vals.push_back(u_dyn);
+                        }
+                        // HOCBF Dodging
+                        double kp = 20.0, kd = 5.0;
+                        double l_kin = std::clamp(-kp * h_dyn - kd * h_dot_dyn, -10.0, 10.0);
+                        C_rows.push_back(J_rel);
+                        l_vals.push_back(l_kin);
+                        u_vals.push_back(1e20);
+                    }           
+                }
+            }
+        
+        // --- Self-Collision Constraint (Dodging its own body) ---
+            for (const auto& [name_, cap_] : capsules_self) {
+                // Prevent duplicate checks
+                if (name >= name_) continue;
+
+                // 1. ACM (Allowed Collision Matrix) Logic:
+                // Skip adjacent links AND links separated by only 1 joint.
+                // (Physical hardware limits prevent them from touching anyway)
+                auto get_idx = [](const std::string& n) {
+                    if (n == "base") return 0;
+                    if (n == "hand") return 7;
+                    if (n.size() > 4 && n.substr(0,4) == "link") return n[4] - '0';
+                    return 99; // Fallback
+                };
+                if (std::abs(get_idx(name) - get_idx(name_)) <= 3) continue;
+
+                auto id_s2 = model_self.getFrameId(cap_.start_frame);
+                auto id_e2 = model_self.getFrameId(cap_.end_frame);
+                Eigen::Vector3d p_s2_raw = data_self.oMf[id_s2].translation();
+                Eigen::Vector3d p_e2_raw = data_self.oMf[id_e2].translation();
+                
+                // 2. Use RAW skeleton points (No 10cm artificial padding!)
+                auto [pt1, pt2] = closest_segments_points(p_s_raw, p_e_raw, p_s2_raw, p_e2_raw);
+                double dist = (pt1 - pt2).norm();
+                double h_self = dist - (cap.radius + cap_.radius + safety_margin);
+
+                // If the arm is folding into a 3cm danger zone with its own body
+                if (dist < 0.5 && h_self < 0.03) {
+                    if (h_self < 0.0) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                            "SELF-COLLISION DETECTED: [%s] is crushing [%s] by %f meters!", 
+                            name.c_str(), name_.c_str(), std::abs(h_self));
+                    }
+                    Eigen::Vector3d n = (dist > 1e-5) ? ((pt1 - pt2) / dist) : Eigen::Vector3d(1,0,0);
+                    
+                    Eigen::MatrixXd J1(6, nv_self); J1.setZero();
+                    pinocchio::getFrameJacobian(model_self, data_self, id_s, pinocchio::LOCAL_WORLD_ALIGNED, J1);
+                    Eigen::MatrixXd J1_pt = J1.topRows(3) - skew(pt1 - p_s_raw) * J1.bottomRows(3);
+                    
+                    Eigen::MatrixXd J2(6, nv_self); J2.setZero();
+                    pinocchio::getFrameJacobian(model_self, data_self, id_s2, pinocchio::LOCAL_WORLD_ALIGNED, J2);
+                    Eigen::MatrixXd J2_pt = J2.topRows(3) - skew(pt2 - p_s2_raw) * J2.bottomRows(3);
+                    
+                    Eigen::RowVectorXd J_self_rel = n.transpose() * (J1_pt - J2_pt);
+                    double h_dot_self = J_self_rel.dot(v_safe);
+
+                    double kp = 20.0, kd = 5.0;
+                    double l_kin = std::clamp(-kp * h_self - kd * h_dot_self, -2.0, 2.0);
+                    
+                    C_rows.push_back(J_self_rel);
+                    l_vals.push_back(l_kin);
+                    u_vals.push_back(1e20);
+                }
+            }
+
         }
-
-        // if (loop_count % 100 == 0) { 
-        //     RCLCPP_INFO(get_logger(), 
-        //         "[%s] OBS DEBUG: World=[%.2f, %.2f] | Offset=[%.2f, %.2f] | Local=[%.2f, %.2f] | Closest Link='%s' Dist=%.3fm",
-        //         get_namespace(),
-        //         obs_world(0), obs_world(1),
-        //         base_offset(0), base_offset(1),
-        //         obs_local(0), obs_local(1),
-        //         closest_link.c_str(), min_dist_found);
-        // }
-
+        
         auto t_constr_end = std::chrono::high_resolution_clock::now();
 
-        const int max_c = 60;
+        const int max_c = 150;
         Eigen::MatrixXd C_t = Eigen::MatrixXd::Zero(max_c, nv_self); //constraint
         Eigen::VectorXd l_t = Eigen::VectorXd::Constant(max_c, -1e20); //lower limit
         Eigen::VectorXd u_t = Eigen::VectorXd::Constant(max_c, 1e20); //upper limit 
 
-        apply_limits(C_t, l_t, u_t, C_rows, l_vals, dt);
+        if (!cbf_on){
+            C_rows.clear();
+            l_vals.clear();
+            u_vals.clear();
+        }
+        apply_limits(C_t, l_t, u_t, C_rows, l_vals, u_vals, dt);
 
         auto t_qp_start = std::chrono::high_resolution_clock::now();
+
+        double kp_acc = 10.0;
+        Eigen::VectorXd a_des = kp_acc*(v_des-v_safe);
+        Eigen::MatrixXd H = Eigen::MatrixXd::Identity(nv_self, nv_self);
 
         try {
             if (!solver_initialized) {
@@ -544,16 +681,16 @@ private:
                 qp->settings.max_iter_in = 10;
                 qp->settings.check_duality_gap = false;
                 qp->settings.verbose = false;
-                qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
+                //qp->settings.initial_guess = proxsuite::proxqp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
                 
                 // Goal: minimize difference between v_safe and v_des 
-                qp->init(Eigen::MatrixXd::Identity(nv_self, nv_self), -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
+                qp->init(H, -a_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
                 solver_initialized = true;
             } else {
                 // argument in order of (H, g, A, b, C, l, u)
                 // H: Hessian >> no value as goal didn't change
                 // Ax = b (Equality constraint) > no equality constraint so zero 
-                qp->update(std::nullopt, -v_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
+                qp->update(std::nullopt, -a_des, std::nullopt, std::nullopt, C_t, l_t, u_t);
             }
             
             // Shafety Check and Execution 
@@ -570,13 +707,24 @@ private:
                     RCLCPP_ERROR(this->get_logger(), "QP SLOW (%ld ms)!", qp_dur);
                     v_safe.setZero();
                 } else {
-                    v_safe = (qp->results.info.status == proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) ? 
-                             qp->results.x : Eigen::VectorXd::Zero(nv_self);
+                    if (qp->results.info.status == proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
+                        // Extract acceleration and integrate it into velocity
+                        Eigen::VectorXd a_safe = qp->results.x;
+                        v_safe += a_safe * dt; } 
+                else {RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                            "QP Failed! Robot Frozen. Status: %d", (int)qp->results.info.status);
+                        v_safe *= 0.90; // Smooth brake on failure
+                    }
                 }
             }
+            for(int i=0; i<nv_self; ++i) {
+                v_safe(i) = std::clamp(v_safe(i), -v_limit(i), v_limit(i));
+            }
+        
+
         } catch (...) {
             RCLCPP_ERROR(this->get_logger(), "QP solver exception - emergency stop");
-            v_safe.setZero();
+            v_safe *= 0.9;
             solver_initialized = false;
         }
 
@@ -587,9 +735,9 @@ private:
         auto d_qp  = std::chrono::duration_cast<std::chrono::microseconds>(t_qp_end - t_qp_start).count();
         auto d_tot = std::chrono::duration_cast<std::chrono::microseconds>(t_qp_end - t_start).count();
 
-        if (d_tot > 1000) {
-            RCLCPP_WARN(this->get_logger(), "TIMING: Total=%ld us | Kin=%ld | Cons=%ld | QP=%ld", d_tot, d_kin, d_con, d_qp);
-        }
+        // if (d_tot > 1000) {
+        //     RCLCPP_WARN(this->get_logger(), "TIMING: Total=%ld us | Kin=%ld | Cons=%ld | QP=%ld", d_tot, d_kin, d_con, d_qp);
+        // }
 
         // Pulls joint values(not the fingers) and sent them to velocity controller 
         std_msgs::msg::Float64MultiArray cmd;
@@ -607,6 +755,11 @@ private:
         for(int i=0; i<nq_self; ++i) msg_out.position[i] = q_safe[i];
         for(int i=0; i<nv_self; ++i) msg_out.velocity[i] = v_safe[i];
         pub_safe->publish(msg_out);
+        loop_count++;
+        if ((now - last_viz_time).seconds() > 0.033) { // 30 Hz refresh rate
+            publish_markers();
+            last_viz_time = now;
+        }
     }
 
     void add_constraint(std::vector<Eigen::MatrixXd>& C, std::vector<double>& L, 
@@ -627,36 +780,36 @@ private:
     }
 
     void apply_limits(Eigen::MatrixXd& C, Eigen::VectorXd& L, Eigen::VectorXd& U, 
-                 const std::vector<Eigen::MatrixXd>& Cr, const std::vector<double>& Lr, double dt) {
+                 const std::vector<Eigen::MatrixXd>& Cr, const std::vector<double>& Lr, const std::vector<double>& Ur, double dt) {
         C.setZero();
         L.setConstant(-1e20);
         U.setConstant(1e20);
         int row_idx = 0;
         
         // Apply Obstacle constraint
-        for (size_t i=0; i<Cr.size() && i<30; ++i) { 
+        for (size_t i=0; i<Cr.size(); ++i) { 
             if (row_idx >= C.rows()) break;
-            C.row(row_idx) = Cr[i]; 
-            L(row_idx) = std::clamp(Lr[i], -5.0, 5.0);
+            C.row(row_idx) = Cr[i];
+            L(row_idx) = Lr[i];
+            U(row_idx) = Ur[i];
             row_idx++;
         }
         
+        double a_max = 15.0;  //max acceleration for franka hardware
         // Apply Joint velocity limit
         for (int i=0; i<nv_self; ++i) {
             if (row_idx >= C.rows()) break;
             
             C(row_idx, i) = 1.0;
             
-            double limit_l = std::max(-v_limit(i), (q_min(i) - q_safe(i)) / dt);
-            double limit_u = std::min(v_limit(i), (q_max(i) - q_safe(i)) / dt);
+            double a_v_max = (v_limit(i)-v_safe(i))/dt;
+            double a_v_min = (-v_limit(i) - v_safe(i))/dt;
 
-            if (limit_l > limit_u) {
-                double mid = (limit_l + limit_u) / 2.0;
-                limit_l = mid - 1e-4;
-                limit_u = mid + 1e-4;
-            }
-            L(row_idx) = limit_l;
-            U(row_idx) = limit_u;
+            double a_q_max = (q_max(i)-q_safe(i)-(v_safe(i)*dt))/(dt*dt);
+            double a_q_min = (q_min(i)-q_safe(i)-(v_safe(i)*dt))/(dt*dt);
+
+            L(row_idx) = std::max({-a_max, a_v_min, a_q_min});
+            U(row_idx) = std::min({a_max, a_v_max, a_q_max});
             row_idx++;
         }
     }
@@ -669,6 +822,42 @@ private:
         }
         double t = std::clamp((p - a).dot(ab) / ab.squaredNorm(), 0.0, 1.0); 
         return a + t * ab;
+    }
+    std::pair<Eigen::Vector3d, Eigen::Vector3d> closest_segments_points(
+        Eigen::Vector3d p1, Eigen::Vector3d p2, Eigen::Vector3d p3, Eigen::Vector3d p4) 
+    {
+        Eigen::Vector3d d1 = p2 - p1;
+        Eigen::Vector3d d2 = p4 - p3;
+        Eigen::Vector3d r = p1 - p3;
+        double a = d1.squaredNorm();
+        double e = d2.squaredNorm();
+        double f = d2.dot(r);
+        double s = 0.0;
+        double t = 0.0;
+
+        if (a <= 1e-6 && e <= 1e-6) {
+            s = t = 0.0;
+        }
+        else if (a <= 1e-6) {
+            s = 0.0; t = std::clamp(f / e, 0.0, 1.0);
+        } 
+        else {
+            double c = d1.dot(r);
+            if (e <= 1e-6) {
+                t = 0.0; s = std::clamp(-c / a, 0.0, 1.0);
+            } 
+            else {
+                double b = d1.dot(d2), denom = a * e - b * b;
+                s = (denom != 0.0) ? std::clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+                t = (b * s + f) / e;
+                if (t < 0.0) {
+                    t = 0.0; s = std::clamp(-c / a, 0.0, 1.0);
+                } else if (t > 1.0) {
+                    t = 1.0; s = std::clamp((b - c) / a, 0.0, 1.0);
+                }
+            }
+        }
+        return {p1 + s * d1, p3 + t * d2};
     }
 
     Eigen::Matrix3d skew(Eigen::Vector3d v) { 
