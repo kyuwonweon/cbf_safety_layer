@@ -1,6 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
-#include <franka_msgs/msg/franka_robot_state.hpp> // HARDWARE: Franka Msgs
+#include <sensor_msgs/msg/joint_state.hpp
+#include <franka_msgs/msg/franka_robot_state.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <interactive_markers/interactive_marker_server.hpp> 
@@ -17,7 +17,7 @@
 #include <proxsuite/proxqp/dense/dense.hpp> 
 #include <optional> 
 #include <vector>
-#include <algorithm> // Required for std::clamp
+#include <algorithm> 
 
 using namespace std::chrono_literals;
 
@@ -126,7 +126,6 @@ private:
     Eigen::VectorXd q_min_, q_max_, v_limit_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd_;
 
-    // ... [KEEP YOUR create_interactive_obstacle AND process_int_marker EXACTLY AS THEY WERE] ...
     void create_interactive_obstacle() {
         visualization_msgs::msg::InteractiveMarker int_marker;
         int_marker.header.frame_id = "base";
@@ -185,7 +184,6 @@ private:
         last_time_ = now;
         if (dt < 0.001) return;
 
-        // HARDWARE: Read from measured_joint_state
         static bool initial_pose_set = false;
         if (!initial_pose_set) {
             size_t limit = std::min((size_t)7, msg->measured_joint_state.position.size());
@@ -367,7 +365,6 @@ private:
         }
     }
 
-    // ... [KEEP YOUR publish_markers EXACTLY AS IT WAS] ...
     void publish_markers() {
         visualization_msgs::msg::MarkerArray ma;
         int id = 1;
@@ -430,7 +427,6 @@ private:
         }
     }
 
-    // ... [KEEP YOUR skew AND closest_segment_point EXACTLY AS THEY WERE] ...
     Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
         Eigen::Matrix3d m;
         m << 0, -v(2), v(1), v(2), 0, -v(0), -v(1), v(0), 0;

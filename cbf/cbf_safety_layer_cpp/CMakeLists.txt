@@ -78,6 +78,33 @@ target_include_directories(safety_node_one PUBLIC
   ${Eigen3_INCLUDE_DIRS}
 )
 
+
+# =========================================================
+# BUILD RULES FOR SAFETY_NODE_ONE_HW
+# =========================================================
+add_executable(safety_node_one_hw src/safety_node_one_hw.cpp)
+
+target_link_libraries(safety_node_one_hw PUBLIC
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${franka_msgs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  ament_index_cpp::ament_index_cpp
+  interactive_markers::interactive_markers
+  rclcpp::rclcpp
+  sensor_msgs::sensor_msgs_library
+  tf2_eigen::tf2_eigen
+  tf2_ros::static_transform_broadcaster_node
+  tf2_ros::tf2_ros
+  pinocchio::pinocchio
+  proxsuite::proxsuite
+)
+
+target_include_directories(safety_node_one_hw PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${Eigen3_INCLUDE_DIRS}
+)
 # =========================================================
 # INSTALLATION
 # =========================================================

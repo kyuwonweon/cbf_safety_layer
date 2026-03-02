@@ -53,7 +53,7 @@ def generate_launch_description():
 
     safety_node = Node(
         package='cbf_safety_layer_cpp',
-        executable='safety_node_one',
+        executable='safety_node_one_hw',
         output='screen',
         remappings=[
             ('/safety/joint_states', '/joint_states'),

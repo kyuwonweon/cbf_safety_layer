@@ -1,6 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
-#include <franka_msgs/msg/franka_robot_state.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <interactive_markers/interactive_marker_server.hpp> 
@@ -17,7 +16,6 @@
 #include <proxsuite/proxqp/dense/dense.hpp> 
 #include <optional> 
 #include <vector>
-#include <algorithm> // NEW: Required for std::clamp
 
 using namespace std::chrono_literals;
 
@@ -64,7 +62,6 @@ public:
 
         q_safe_ = Eigen::VectorXd::Zero(nq_);
         v_safe_ = Eigen::VectorXd::Zero(nv_);
-        v_safe_filtered_ = Eigen::VectorXd::Zero(nv_); // NEW: Initialize filter state
 
         // Capsule
         capsules_["base"]      = {"fer_link0", "fer_link1", 0.15};
@@ -77,8 +74,8 @@ public:
 
         // ROS Setup
         auto qos = rclcpp::QoS(10);
-        sub_js_ = this->create_subscription<franka_msgs::msg::FrankaRobotState>(
-            "/franka_robot_state_broadcaster/robot_state", qos, std::bind(&SafetyNode::joint_cb, this, std::placeholders::_1));
+        sub_js_ = this->create_subscription<sensor_msgs::msg::JointState>(
+            "/joint_states_source", qos, std::bind(&SafetyNode::joint_cb, this, std::placeholders::_1));
         pub_safe_ = this->create_publisher<sensor_msgs::msg::JointState>("/safety/joint_states", qos);
         pub_marker_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
 
@@ -112,15 +109,11 @@ private:
     int nq_, nv_;
     int loop_count_ = 0;
     rclcpp::Time last_viz_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-    Eigen::VectorXd q_safe_, v_safe_, v_safe_filtered_;
+    Eigen::VectorXd q_safe_, v_safe_;
     Eigen::Vector3d obs_pose_ = {0.8, 0.0, 0.4}; 
     double obs_radius_ = 0.10;
     double safety_margin_ = 0.02;
     double alpha_ = 5.0;
-    
-    // NEW: Maximum allowable acceleration (rad/s^2) for the CBF output.
-    // 2.0 rad/s^2 is highly responsive but safe for Franka limits.
-    double max_accel_ = 2.0;
 
     Eigen::VectorXd v_user_command_; 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_input_vel_;
@@ -134,7 +127,7 @@ private:
     bool solver_initialized_ = false;
     rclcpp::Time last_time_;
 
-    rclcpp::Subscription<franka_msgs::msg::FrankaRobotState>::SharedPtr sub_js_;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker_;
     rclcpp::TimerBase::SharedPtr viz_timer_;
@@ -204,7 +197,7 @@ private:
         }
     }
 
-    void joint_cb(const franka_msgs::msg::FrankaRobotState::SharedPtr msg) {
+    void joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
         auto now = this->get_clock()->now();
         if (first_run_) {
             last_time_ = now;
@@ -392,27 +385,15 @@ private:
             solver_initialized_ = false; 
         }
 
-        // --- NEW: SLEW RATE LIMITER (ACCELERATION CLAMP) ---
-        // Calculate the maximum change in velocity allowed for this specific dt tick.
-        double max_step = 0.0015;
-        
-        for (int i = 0; i < nv_; ++i) {
-            double diff = v_safe_(i) - v_safe_filtered_(i);
-            // Clamp the difference to prevent acceleration spikes
-            v_safe_filtered_(i) += std::clamp(diff, -max_step, max_step);
-        }
-        // ---------------------------------------------------
-
         if (loop_count_ % 50 == 0 && v_des.norm() > 0.1) {
-             RCLCPP_INFO(this->get_logger(), "QP OUTPUT: v_safe=[%.2f, %.2f...], filtered=[%.2f, %.2f...]", 
-                         v_safe_(0), v_safe_(1), v_safe_filtered_(0), v_safe_filtered_(1));
+             RCLCPP_INFO(this->get_logger(), "QP OUTPUT: v_safe=[%.2f, %.2f...]", v_safe_(0), v_safe_(1));
         }
 
         std_msgs::msg::Float64MultiArray cmd_msg;
-        for(int i=0; i<7; ++i) cmd_msg.data.push_back(v_safe_filtered_[i]); 
+        for(int i=0; i<7; ++i) cmd_msg.data.push_back(v_safe_[i]); 
         pub_cmd_->publish(cmd_msg);
 
-        q_safe_ += v_safe_filtered_ * dt;
+        q_safe_ += v_safe_ * dt;
 
         sensor_msgs::msg::JointState msg_out;
         msg_out.header.stamp = this->get_clock()->now();
@@ -427,7 +408,7 @@ private:
         msg_out.velocity.resize(9);
         for(int i=0; i<9; ++i) {
             msg_out.position[i] = q_safe_[i];
-            msg_out.velocity[i] = v_safe_filtered_[i];
+            msg_out.velocity[i] = v_safe_[i];
         }
         pub_safe_->publish(msg_out);
 
