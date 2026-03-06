@@ -215,12 +215,6 @@ public:
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
         });
-        sub_other_robot = create_subscription<sensor_msgs::msg::JointState>(
-            "/robot1/joint_states", 10, 
-            [this](const sensor_msgs::msg::JointState::SharedPtr msg){
-                update_obstacles_between_robots(msg);
-            }
-        );
 
         sub_teleop_command = create_subscription<sensor_msgs::msg::JointState>(
             "/teleop_vel", 10,
@@ -393,27 +387,6 @@ private:
             other_robot_detected = true;
             RCLCPP_INFO(this->get_logger(), "Other robot detected - enabling inter-robot collision avoidance");
         }
-    }
-
-    void update_obstacles_between_robots(const sensor_msgs::msg::JointState::SharedPtr msg){
-        std::lock_guard<std::mutex> lock(q_other_mutex);
-
-        if (msg->position.size() < static_cast<size_t>(nq_other)){
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Received incomplete joint states for other robot");
-            return;
-        }
-
-        for (int i =0; i<nq_other; ++i){
-            q_other_robot[i] = msg->position[i];
-        }
-        pinocchio::forwardKinematics(model_other, data_other, q_other_robot);
-        pinocchio::updateFramePlacements(model_other, data_other);
-
-        if (!other_robot_detected) {
-        other_robot_detected = true;
-        RCLCPP_INFO(get_logger(), "Other robot stream detected via inter-robot topic.");
-    }
-
     }
 
     void joint_cb_self(const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -925,12 +898,6 @@ private:
 
     void publish_markers() {
         visualization_msgs::msg::MarkerArray ma;
-
-        std::string root_frame = "base";
-        if (capsules_self.find("base") != capsules_self.end()) {
-             root_frame = capsules_self["base"].start_frame; 
-        }
-
         int id = 1;
         for(const auto& [name, cap] : capsules_self) {
             if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) continue;
@@ -962,12 +929,10 @@ private:
             if (len < 1e-4) {
                 // If start and end are same point, draw a Sphere
                 m.type = visualization_msgs::msg::Marker::SPHERE;
-                m.pose.position.x = p1.x(); 
-                m.pose.position.y = p1.y(); 
-                m.pose.position.z = p1.z();
+                m.pose.position.x = p1.x() + base_offset(0); 
+                m.pose.position.y = p1.y() + base_offset(1); 
+                m.pose.position.z = p1.z() + base_offset(2);
                 m.scale.x = m.scale.y = m.scale.z = cap.radius * 2.0;
-                
-                // Identity orientation
                 m.pose.orientation.w = 1.0; 
             } else {
                 // Normal Cylinder Capsule
