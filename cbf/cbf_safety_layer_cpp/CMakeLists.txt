@@ -108,7 +108,7 @@ target_include_directories(safety_node_one_hw PUBLIC
 # =========================================================
 # INSTALLATION
 # =========================================================
-install(TARGETS safety_node_cpp safety_node_one
+install(TARGETS safety_node_cpp safety_node_one safety_node_one_hw
   DESTINATION lib/${PROJECT_NAME}
 )
 

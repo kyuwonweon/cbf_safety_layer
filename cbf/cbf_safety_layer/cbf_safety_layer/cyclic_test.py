@@ -20,15 +20,13 @@ class CyclicDriver(Node):
         wave = math.sin(t * 0.8)
         
         v_base = 1.0 * wave       # Swing base inward
-        v_shoulder = 0.4 * wave   # Pitch shoulder forward toward the center
-        v_elbow = 0.6 * wave      # Straighten elbow to maximize reach
 
         msg1 = JointState()
         # [Base, Shoulder, Roll, Elbow, Wrist1, Wrist2, Wrist3, Finger1, Finger2]
-        msg1.velocity = [-v_base, v_shoulder, 0.0, v_elbow, 0.0, 0.0, 0.0, 0.0, 0.0]
+        msg1.velocity = [-v_base, 0.2, 0.0, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         msg2 = JointState()
-        msg2.velocity = [v_base, v_shoulder, 0.0, v_elbow, 0.0, 0.0, 0.0, 0.0, 0.0]
+        msg2.velocity = [v_base, 0.2, 0.0, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         self.pub1.publish(msg1)
         self.pub2.publish(msg2)

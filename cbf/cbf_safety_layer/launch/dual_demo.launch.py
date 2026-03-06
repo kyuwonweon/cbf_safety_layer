@@ -103,7 +103,7 @@ def generate_launch_description():
             'base_offset_x': 0.0,
             'base_offset_y': 0.4,
             'base_offset_z': 0.0,
-            'other_base_offsey_x': 0.0,
+            'other_base_offset_x': 0.0,
             'other_base_offset_y': -0.4,
             'other_base_offset_z': 0.0,
             'use_fallback_urdf': False 
@@ -112,8 +112,17 @@ def generate_launch_description():
             ('/joint_states_source', 'desired_joint_states'),
             ('/joint_states_source_other', '/robot2/joint_states'),
             ('/safety_marker', '/robot1/safety_marker'),
-            ('safety/joint_states', 'joint_states')
+            ('safety/joint_states', 'joint_states'),
+            ('safety_input_cmd', 'safety_input_cmd')
         ]
+    )
+
+    robot1_teleop_node = Node(
+        package='cbf_safety_layer',
+        executable='teleop_node',
+        name='teleop_robot1',
+        parameters=[{'robot_id': 1}],
+        remappings=[('safety/input_joint_states', '/robot1/safety_input_cmd'),]
     )
 
     # Robot2
@@ -167,7 +176,7 @@ def generate_launch_description():
             'base_offset_z': 0.0,
             'other_base_offset_x': 0.0,
             'other_base_offset_y': 0.4,
-            'other_base_offset': 0.0,
+            'other_base_offset_z': 0.0,
             'use_fallback_urdf': False
         }],
         remappings=[
@@ -207,10 +216,12 @@ def generate_launch_description():
                 robot1_robot_state_publisher,
                 robot1_joint_state_publisher,
                 robot1_safety_node,
+                robot1_teleop_node,
                 robot2_robot_state_publisher,
                 robot2_joint_state_publisher,
                 robot2_safety_node,
                 ]
             ),
         TimerAction(period=1.5, actions=[rviz_node]),
-        ])
+        ]
+    )

@@ -131,7 +131,8 @@ public:
         q_safe = Eigen::VectorXd::Zero(nq_self);
         q_other_robot = Eigen::VectorXd::Zero(nq_other);
         v_safe = Eigen::VectorXd::Zero(nv_self);
-        v_user_command = Eigen::VectorXd::Zero(nv_self);
+        v_manual_command = Eigen::VectorXd::Zero(nv_self);
+        v_teleop_command = Eigen::VectorXd::Zero(nv_self);
         v_other_robot = Eigen::VectorXd::Zero(nv_other);
 
         // -------------------------------------------------------
@@ -198,12 +199,12 @@ public:
         pub_marker = create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
         pub_cmd = create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
 
-        sub_input_vel = create_subscription<sensor_msgs::msg::JointState>(
-            "safety/input_joint_states", 10, 
+        sub_manual_command = create_subscription<sensor_msgs::msg::JointState>(
+            "/manual_vel", 10, 
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(cmd_mutex);
                 if (msg->velocity.size() == static_cast<size_t>(nv_self)) {
-                    for(int i=0; i<nv_self; ++i) v_user_command(i) = msg->velocity[i];
+                    for(int i=0; i<nv_self; ++i) v_manual_command(i) = msg->velocity[i];
                 }
             });
 
@@ -213,6 +214,22 @@ public:
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
         });
+        sub_other_robot = create_subscription<sensor_msgs::msg::JointState>(
+            "/robot1/joint_states", 10, 
+            [this](const sensor_msgs::msg::JointState::SharedPtr msg){
+                update_obstacles_between_robots(msg);
+            }
+        );
+
+        sub_teleop_command = create_subscription<sensor_msgs::msg::JointState>(
+            "/teleop_vel", 10,
+            [this](const sensor_msgs::msg::JointState::SharedPtr msg){
+                std::lock_guard<std::mutex> lock(cmd_mutex);
+                if (msg->velocity.size() == static_cast<size_t>(nv_self)){
+                    for (int i=0; i<nv_self; ++i) v_teleop_command(i) = msg -> velocity[i];
+                }
+            }
+        );
 
         sub_cbf_toggle = create_subscription<std_msgs::msg::Bool>("cbf_toggle", qos, 
         [this](const std_msgs::msg::Bool::SharedPtr msg){
@@ -255,7 +272,7 @@ private:
     std::vector<double> l_vals;
     std::vector<double> u_vals;
     
-    Eigen::VectorXd q_safe, v_safe, v_user_command, q_min, q_max, v_limit;
+    Eigen::VectorXd q_safe, v_safe, v_manual_command, v_teleop_command, q_min, q_max, v_limit;
     Eigen::VectorXd q_other_robot, v_other_robot;
     Eigen::Vector3d obs_pose = {0.6, 0.0, 0.4}; 
     double obs_radius = 0.10, safety_margin = 0.02, alpha = 5.0, floor_height = 0.0;
@@ -272,7 +289,7 @@ private:
     std::mutex obs_mutex;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cbf_toggle;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_input_vel;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_manual_command, sub_other_robot;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd;
@@ -377,6 +394,27 @@ private:
         }
     }
 
+    void update_obstacles_between_robots(const sensor_msgs::msg::JointState::SharedPtr msg){
+        std::lock_guard<std::mutex> lock(q_other_mutex);
+
+        if (msg->position.size() < static_cast<size_t>(nq_other)){
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Received incomplete joint states for other robot");
+            return;
+        }
+
+        for (int i =0; i<nq_other; ++i){
+            q_other_robot[i] = msg->position[i];
+        }
+        pinocchio::forwardKinematics(model_other, data_other, q_other_robot);
+        pinocchio::updateFramePlacements(model_other, data_other);
+
+        if (!other_robot_detected) {
+        other_robot_detected = true;
+        RCLCPP_INFO(get_logger(), "Other robot stream detected via inter-robot topic.");
+    }
+
+    }
+
     void joint_cb_self(const sensor_msgs::msg::JointState::SharedPtr msg) {
         // Profiling how long code takes at each section (local execution timing)
         auto t_start = std::chrono::high_resolution_clock::now();
@@ -403,6 +441,13 @@ private:
             initial_pose_set = true;
         }
 
+        double drift_error = (q_safe - q_input).norm();
+        if (drift_error > 0.05){
+            RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 2000, "Drift_Detected *%.4f rad is corrected." ,drift_error);
+            q_safe = q_input;
+            v_safe.setZero();
+        }
+
         // Update Kinematics 
         pinocchio::forwardKinematics(model_self, data_self, q_safe);
         pinocchio::updateFramePlacements(model_self, data_self);
@@ -418,7 +463,12 @@ private:
         Eigen::VectorXd v_des;
         {
             std::lock_guard<std::mutex> lock(cmd_mutex);
-            v_des = v_user_command.cwiseMin(2.0).cwiseMax(-2.0);
+            if (v_teleop_command.norm() > 0.01){
+                v_des = v_teleop_command;
+            } else{
+                v_des = v_manual_command;
+            }
+            v_des = v_des.cwiseMin(2.0).cwiseMax(-2.0);
         }
 
         // Copy position of other robot
