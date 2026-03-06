@@ -289,7 +289,7 @@ private:
     std::mutex obs_mutex;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cbf_toggle;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_manual_command, sub_other_robot;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_manual_command, sub_teleop_command, sub_other_robot;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd;
@@ -440,13 +440,17 @@ private:
             }
             initial_pose_set = true;
         }
+        // Eigen::VectorXd q_input = Eigen::VectorXd::Zero(nq_self);
+        // for (size_t i = 0; i < std::min(static_cast<size_t>(nq_self), msg->position.size()); ++i) {
+        //     q_input[i] = msg->position[i];
+        // }
 
-        double drift_error = (q_safe - q_input).norm();
-        if (drift_error > 0.05){
-            RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 2000, "Drift_Detected *%.4f rad is corrected." ,drift_error);
-            q_safe = q_input;
-            v_safe.setZero();
-        }
+        // double drift_error = (q_safe - q_input).norm();
+        // if (drift_error > 0.05){
+        //     RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 2000, "Drift_Detected *%.4f rad is corrected." ,drift_error);
+        //     q_safe = q_input;
+        //     v_safe.setZero();
+        // }
 
         // Update Kinematics 
         pinocchio::forwardKinematics(model_self, data_self, q_safe);
