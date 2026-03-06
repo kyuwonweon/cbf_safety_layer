@@ -48,6 +48,7 @@ public:
         declare_parameter("other_base_offset_y", 0.0);
         declare_parameter("other_base_offset_z", 0.0);
         base_offset = Eigen::Vector3d::Zero();
+        other_base_offset = Eigen::Vector3d::Zero();
 
         // get robot offsets from the "base" frame for rivz
         base_offset(0) = get_parameter("base_offset_x").as_double();
@@ -440,17 +441,6 @@ private:
             }
             initial_pose_set = true;
         }
-        // Eigen::VectorXd q_input = Eigen::VectorXd::Zero(nq_self);
-        // for (size_t i = 0; i < std::min(static_cast<size_t>(nq_self), msg->position.size()); ++i) {
-        //     q_input[i] = msg->position[i];
-        // }
-
-        // double drift_error = (q_safe - q_input).norm();
-        // if (drift_error > 0.05){
-        //     RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 2000, "Drift_Detected *%.4f rad is corrected." ,drift_error);
-        //     q_safe = q_input;
-        //     v_safe.setZero();
-        // }
 
         // Update Kinematics 
         pinocchio::forwardKinematics(model_self, data_self, q_safe);
@@ -547,8 +537,21 @@ private:
                 if (h_f < 0.15) {
                     Eigen::MatrixXd J_e(6, nv_self);
                     pinocchio::getFrameJacobian(model_self, data_self, id_e, pinocchio::LOCAL_WORLD_ALIGNED, J_e);
-                    C_rows.push_back(J_e.row(2));
-                    l_vals.push_back(-alpha * std::max(h_f, 0.001));
+                    Eigen::RowVectorXd J_floor = J_e.row(2);
+                    double h_dot_f = J_floor.dot(v_safe);
+                    double h_f_safe = std::max(h_f, -0.05);
+                    double b_floor = (gamma * h_f_safe) - ke;
+                    double u_floor = (gamma * h_dot_f) + (alpha*b_floor);
+                    if (v_safe.norm()>0.01){
+                        C_rows.push_back(c_energy);
+                        l_vals.push_back(-1e20);
+                        u_vals.push_back(u_floor);
+                    }
+                    double kp = 20.0;
+                    double kd = 5.0;
+                    double l_kin = std::clamp(-kp*h_f - kd*h_dot_f, -10.0, 10.0);
+                    C_rows.push_back(J_floor);
+                    l_vals.push_back(l_kin);
                     u_vals.push_back(1e20);
                 }
             }
@@ -947,7 +950,7 @@ private:
             }
             
             visualization_msgs::msg::Marker m;
-            m.header.frame_id = root_frame; 
+            m.header.frame_id = "base"; 
             m.header.stamp = this->get_clock()->now();
             m.id = id++; 
             m.action = visualization_msgs::msg::Marker::ADD;
@@ -969,9 +972,9 @@ private:
             } else {
                 // Normal Cylinder Capsule
                 m.type = visualization_msgs::msg::Marker::CYLINDER;
-                m.pose.position.x = (p1.x()+p2.x())/2.0; 
-                m.pose.position.y = (p1.y()+p2.y())/2.0; 
-                m.pose.position.z = (p1.z()+p2.z())/2.0;
+                m.pose.position.x = (p1.x()+p2.x())/2.0 + base_offset(0); 
+                m.pose.position.y = (p1.y()+p2.y())/2.0 + base_offset(1); 
+                m.pose.position.z = (p1.z()+p2.z())/2.0 + base_offset(2);
                 
                 Eigen::Quaterniond q; 
                 q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), p2 - p1);
