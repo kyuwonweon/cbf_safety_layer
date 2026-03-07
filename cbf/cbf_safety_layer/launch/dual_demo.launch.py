@@ -103,17 +103,27 @@ def generate_launch_description():
             'base_offset_x': 0.0,
             'base_offset_y': 0.4,
             'base_offset_z': 0.0,
-            'other_base_offsey_x': 0.0,
+            'other_base_offset_x': 0.0,
             'other_base_offset_y': -0.4,
             'other_base_offset_z': 0.0,
-            'use_fallback_urdf': False 
+            'use_fallback_urdf': False
         }],
         remappings=[
             ('/joint_states_source', 'desired_joint_states'),
             ('/joint_states_source_other', '/robot2/joint_states'),
             ('/safety_marker', '/robot1/safety_marker'),
-            ('safety/joint_states', 'joint_states')
+            ('safety/joint_states', 'joint_states'),
+            ('/manual_vel', '/robot1/manual_vel'),
+            ('/teleop_vel', '/robot1/teleop_vel'),
         ]
+    )
+
+    robot1_teleop_node = Node(
+        package='cbf_safety_layer',
+        executable='teleop_node',
+        name='teleop_robot1',
+        parameters=[{'robot_id': 1}],
+        remappings=[('safety/input_joint_states', '/robot1/teleop_vel'),]
     )
 
     # Robot2
@@ -167,14 +177,16 @@ def generate_launch_description():
             'base_offset_z': 0.0,
             'other_base_offset_x': 0.0,
             'other_base_offset_y': 0.4,
-            'other_base_offset': 0.0,
+            'other_base_offset_z': 0.0,
             'use_fallback_urdf': False
         }],
         remappings=[
             ('/joint_states_source', 'desired_joint_states'),
             ('/joint_states_source_other', '/robot1/joint_states'),
             ('/safety_marker', '/robot2/safety_marker'),
-            ('safety/joint_states', 'joint_states')
+            ('safety/joint_states', 'joint_states'),
+            ('/manual_vel', '/robot2/manual_vel'),
+            ('/teleop_vel', '/robot2/teleop_vel'),
         ]
     )
 
@@ -196,6 +208,17 @@ def generate_launch_description():
         output='screen'
     )
 
+    joy_node = Node(
+        package='joy',
+        executable='joy_node',
+        name='joy_node',
+        output='screen',
+        parameters=[{
+            'deadzone': 0.05,
+            'autorepeat_rate': 20.0,
+        }]
+    )
+
     return LaunchDescription([
         world_to_base,
         robot1_tf,
@@ -204,13 +227,16 @@ def generate_launch_description():
         TimerAction(
             period=1.0,
             actions=[
+                joy_node,
                 robot1_robot_state_publisher,
                 robot1_joint_state_publisher,
                 robot1_safety_node,
+                robot1_teleop_node,
                 robot2_robot_state_publisher,
                 robot2_joint_state_publisher,
                 robot2_safety_node,
                 ]
             ),
         TimerAction(period=1.5, actions=[rviz_node]),
-        ])
+        ]
+    )

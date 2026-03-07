@@ -48,6 +48,7 @@ public:
         declare_parameter("other_base_offset_y", 0.0);
         declare_parameter("other_base_offset_z", 0.0);
         base_offset = Eigen::Vector3d::Zero();
+        other_base_offset = Eigen::Vector3d::Zero();
 
         // get robot offsets from the "base" frame for rivz
         base_offset(0) = get_parameter("base_offset_x").as_double();
@@ -131,7 +132,8 @@ public:
         q_safe = Eigen::VectorXd::Zero(nq_self);
         q_other_robot = Eigen::VectorXd::Zero(nq_other);
         v_safe = Eigen::VectorXd::Zero(nv_self);
-        v_user_command = Eigen::VectorXd::Zero(nv_self);
+        v_manual_command = Eigen::VectorXd::Zero(nv_self);
+        v_teleop_command = Eigen::VectorXd::Zero(nv_self);
         v_other_robot = Eigen::VectorXd::Zero(nv_other);
 
         // -------------------------------------------------------
@@ -198,12 +200,12 @@ public:
         pub_marker = create_publisher<visualization_msgs::msg::MarkerArray>("/safety_marker", qos);
         pub_cmd = create_publisher<std_msgs::msg::Float64MultiArray>("/velocity_group_controller/commands", 10);
 
-        sub_input_vel = create_subscription<sensor_msgs::msg::JointState>(
-            "safety/input_joint_states", 10, 
+        sub_manual_command = create_subscription<sensor_msgs::msg::JointState>(
+            "/manual_vel", 10, 
             [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(cmd_mutex);
                 if (msg->velocity.size() == static_cast<size_t>(nv_self)) {
-                    for(int i=0; i<nv_self; ++i) v_user_command(i) = msg->velocity[i];
+                    for(int i=0; i<nv_self; ++i) v_manual_command(i) = msg->velocity[i];
                 }
             });
 
@@ -213,6 +215,16 @@ public:
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_pose << msg->x, msg->y, msg->z;
         });
+
+        sub_teleop_command = create_subscription<sensor_msgs::msg::JointState>(
+            "/teleop_vel", 10,
+            [this](const sensor_msgs::msg::JointState::SharedPtr msg){
+                std::lock_guard<std::mutex> lock(cmd_mutex);
+                if (msg->velocity.size() == static_cast<size_t>(nv_self)){
+                    for (int i=0; i<nv_self; ++i) v_teleop_command(i) = msg -> velocity[i];
+                }
+            }
+        );
 
         sub_cbf_toggle = create_subscription<std_msgs::msg::Bool>("cbf_toggle", qos, 
         [this](const std_msgs::msg::Bool::SharedPtr msg){
@@ -255,7 +267,7 @@ private:
     std::vector<double> l_vals;
     std::vector<double> u_vals;
     
-    Eigen::VectorXd q_safe, v_safe, v_user_command, q_min, q_max, v_limit;
+    Eigen::VectorXd q_safe, v_safe, v_manual_command, v_teleop_command, q_min, q_max, v_limit;
     Eigen::VectorXd q_other_robot, v_other_robot;
     Eigen::Vector3d obs_pose = {0.6, 0.0, 0.4}; 
     double obs_radius = 0.10, safety_margin = 0.02, alpha = 5.0, floor_height = 0.0;
@@ -272,7 +284,7 @@ private:
     std::mutex obs_mutex;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cbf_toggle;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_input_vel;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_js_self, sub_js_other, sub_manual_command, sub_teleop_command, sub_other_robot;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_safe;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_marker;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_cmd;
@@ -418,7 +430,12 @@ private:
         Eigen::VectorXd v_des;
         {
             std::lock_guard<std::mutex> lock(cmd_mutex);
-            v_des = v_user_command.cwiseMin(2.0).cwiseMax(-2.0);
+            if (v_teleop_command.norm() > 0.01){
+                v_des = v_teleop_command;
+            } else{
+                v_des = v_manual_command;
+            }
+            v_des = v_des.cwiseMin(2.0).cwiseMax(-2.0);
         }
 
         // Copy position of other robot
@@ -493,8 +510,21 @@ private:
                 if (h_f < 0.15) {
                     Eigen::MatrixXd J_e(6, nv_self);
                     pinocchio::getFrameJacobian(model_self, data_self, id_e, pinocchio::LOCAL_WORLD_ALIGNED, J_e);
-                    C_rows.push_back(J_e.row(2));
-                    l_vals.push_back(-alpha * std::max(h_f, 0.001));
+                    Eigen::RowVectorXd J_floor = J_e.row(2);
+                    double h_dot_f = J_floor.dot(v_safe);
+                    double h_f_safe = std::max(h_f, -0.05);
+                    double b_floor = (gamma * h_f_safe) - ke;
+                    double u_floor = (gamma * h_dot_f) + (alpha*b_floor);
+                    if (v_safe.norm()>0.01){
+                        C_rows.push_back(c_energy);
+                        l_vals.push_back(-1e20);
+                        u_vals.push_back(u_floor);
+                    }
+                    double kp = 20.0;
+                    double kd = 5.0;
+                    double l_kin = std::clamp(-kp*h_f - kd*h_dot_f, -10.0, 10.0);
+                    C_rows.push_back(J_floor);
+                    l_vals.push_back(l_kin);
                     u_vals.push_back(1e20);
                 }
             }
@@ -868,12 +898,6 @@ private:
 
     void publish_markers() {
         visualization_msgs::msg::MarkerArray ma;
-
-        std::string root_frame = "base";
-        if (capsules_self.find("base") != capsules_self.end()) {
-             root_frame = capsules_self["base"].start_frame; 
-        }
-
         int id = 1;
         for(const auto& [name, cap] : capsules_self) {
             if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) continue;
@@ -893,7 +917,7 @@ private:
             }
             
             visualization_msgs::msg::Marker m;
-            m.header.frame_id = root_frame; 
+            m.header.frame_id = "base"; 
             m.header.stamp = this->get_clock()->now();
             m.id = id++; 
             m.action = visualization_msgs::msg::Marker::ADD;
@@ -905,19 +929,17 @@ private:
             if (len < 1e-4) {
                 // If start and end are same point, draw a Sphere
                 m.type = visualization_msgs::msg::Marker::SPHERE;
-                m.pose.position.x = p1.x(); 
-                m.pose.position.y = p1.y(); 
-                m.pose.position.z = p1.z();
+                m.pose.position.x = p1.x() + base_offset(0); 
+                m.pose.position.y = p1.y() + base_offset(1); 
+                m.pose.position.z = p1.z() + base_offset(2);
                 m.scale.x = m.scale.y = m.scale.z = cap.radius * 2.0;
-                
-                // Identity orientation
                 m.pose.orientation.w = 1.0; 
             } else {
                 // Normal Cylinder Capsule
                 m.type = visualization_msgs::msg::Marker::CYLINDER;
-                m.pose.position.x = (p1.x()+p2.x())/2.0; 
-                m.pose.position.y = (p1.y()+p2.y())/2.0; 
-                m.pose.position.z = (p1.z()+p2.z())/2.0;
+                m.pose.position.x = (p1.x()+p2.x())/2.0 + base_offset(0); 
+                m.pose.position.y = (p1.y()+p2.y())/2.0 + base_offset(1); 
+                m.pose.position.z = (p1.z()+p2.z())/2.0 + base_offset(2);
                 
                 Eigen::Quaterniond q; 
                 q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), p2 - p1);
