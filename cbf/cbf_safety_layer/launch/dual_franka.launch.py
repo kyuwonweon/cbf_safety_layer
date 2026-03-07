@@ -98,7 +98,7 @@ def generate_launch_description():
                              'launch', 'franka.launch.py')
             ),
             launch_arguments={
-                'robot_ip':           '192.168.51.21',
+                'robot_ip':           '192.168.51.19',
                 'use_fake_hardware':  'false',
                 'robot_type':         'fer',
                 'arm_id':             'fer',
