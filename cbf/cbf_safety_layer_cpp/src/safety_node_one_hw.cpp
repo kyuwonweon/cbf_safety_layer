@@ -1,5 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <franka_msgs/msg/franka_robot_state.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
@@ -212,6 +212,11 @@ private:
 
         std::vector<Eigen::MatrixXd> C_rows;
         std::vector<double> l_vals, u_vals, energy_bounds;
+
+        C_rows.reserve(40);
+        l_vals.reserve(40);
+        u_vals.reserve(40);
+        energy_bounds.reserve(40);
         
         double gamma = 2.0;
         double ke = (0.5*v_safe_.transpose() * data_.M * v_safe_).value();
@@ -235,7 +240,7 @@ private:
 
             if (name != "base") {
                 double h_floor = p_e[2] - capsule.radius - safety_margin_;
-                if (h_floor < 0.2) { 
+                if (h_floor < 0.05) { 
                     Eigen::MatrixXd J_end(6, nv_); J_end.setZero();
                     pinocchio::getFrameJacobian(model_, data_, id_end, pinocchio::LOCAL_WORLD_ALIGNED, J_end);
                     Eigen::Vector3d lever = p_e - data_.oMf[id_end].translation();
@@ -248,9 +253,9 @@ private:
 
                     energy_bounds.push_back(u_floor);
 
-                    double kp = 20.0, kd = 5.0;
+                    double kp = 8.0, kd = 2.0;
                     C_rows.push_back(J_tip.row(2));
-                    l_vals.push_back(std::clamp(-kp*h_floor - kd*h_dot_floor, -10.0, 10.0));
+                    l_vals.push_back(std::clamp(-kp*h_floor - kd*h_dot_floor, -5.0, 5.0));
                     u_vals.push_back(1e20);
                 }
             }
@@ -308,6 +313,7 @@ private:
             if (!solver_initialized_) {
                 qp_ = std::make_shared<proxsuite::proxqp::dense::QP<double>>(nv_, 0, max_constraints);
                 qp_->settings.eps_abs = 1.0e-5; qp_->settings.verbose = false;
+                qp_->settings.max_iter = 25;
                 qp_->init(H, g, A_eq, b_eq, C_total, l_total, u_total);
                 solver_initialized_ = true;
             } else {
@@ -334,10 +340,10 @@ private:
         }
 
         // HARDWARE DEFENSE: Slew Rate Limiter (Acceleration Clamp)
-        double max_step = 0.0015;
+        double max_step = 0.0005;
+        double ema_alpha = 0.05;
         for (int i = 0; i < nv_; ++i) {
-            double diff = v_safe_(i) - v_safe_filtered_(i);
-            v_safe_filtered_(i) += std::clamp(diff, -max_step, max_step);
+            v_safe_filtered_(i) = ((1-ema_alpha) * v_safe_filtered_(i)) + (ema_alpha * v_safe_(i));
         }
 
         std_msgs::msg::Float64MultiArray cmd_msg;
