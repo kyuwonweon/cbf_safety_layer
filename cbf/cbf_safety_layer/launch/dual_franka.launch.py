@@ -12,7 +12,7 @@ from launch_ros.actions import Node, SetRemap
 def generate_launch_description():
 
     # -----------------------------------------------------------------------
-    # URDF preparation — same as simulation launch
+    # URDF preparation
     # -----------------------------------------------------------------------
     urdf_file = os.path.join(
         get_package_share_directory('franka_description'),
@@ -51,7 +51,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='robot1_base_broadcaster',
         arguments=['--x', '0', '--y', '0.4', '--z', '0',
-                   '--yaw', '0', '--pitch', '0', '--roll', '0',
+                   '--yaw', '-1.5708', '--pitch', '0', '--roll', '0',
                    '--frame-id', 'base', '--child-frame-id', 'robot1_fer_link0']
     )
 
@@ -60,14 +60,12 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='robot2_base_broadcaster',
         arguments=['--x', '0', '--y', '-0.4', '--z', '0',
-                   '--yaw', '0', '--pitch', '0', '--roll', '0',
+                   '--yaw', '1.5708', '--pitch', '0', '--roll', '0',
                    '--frame-id', 'base', '--child-frame-id', 'robot2_fer_link0']
     )
 
     # -----------------------------------------------------------------------
     # Robot 1 hardware bringup
-    # Each robot gets its own controller_manager under its own namespace.
-    # TF from franka_bringup is discarded — our static broadcasters own the tree.
     # -----------------------------------------------------------------------
     robot1_franka = GroupAction([
         SetRemap(src='/joint_states',  dst='/robot1/franka_joint_states'),
@@ -113,7 +111,6 @@ def generate_launch_description():
 
     # -----------------------------------------------------------------------
     # Controller spawning — broadcaster first, then velocity controller
-    # Chained with OnProcessExit so velocity spawner waits for broadcaster
     # -----------------------------------------------------------------------
     robot1_spawn_broadcaster = Node(
         package='controller_manager',
@@ -210,6 +207,8 @@ def generate_launch_description():
             'other_base_offset_x':     0.0,
             'other_base_offset_y':    -0.4,
             'other_base_offset_z':     0.0,
+            'base_yaw': -1.5708,
+            'other_base_yaw': 1.5708,
             'use_fallback_urdf':        False,
         }],
         remappings=[
@@ -243,6 +242,8 @@ def generate_launch_description():
             'other_base_offset_x':     0.0,
             'other_base_offset_y':     0.4,
             'other_base_offset_z':     0.0,
+            'base_yaw': 1.5708,
+            'other_base_yaw': -1.5708,
             'use_fallback_urdf':        False,
         }],
         remappings=[
@@ -294,18 +295,13 @@ def generate_launch_description():
     )
 
     # -----------------------------------------------------------------------
-    # Launch order:
-    #   t=0.0  static TFs + both franka bringups + controller spawners
-    #   t=1.0  RSPs + safety nodes + teleop + joy
-    #   t=2.0  RViz (after TF tree is fully settled)
+    # Launch order
     # -----------------------------------------------------------------------
     return LaunchDescription([
-        # Static TF — first, no delay
         world_to_base,
         robot1_tf,
         robot2_tf,
 
-        # Hardware bringup + controller spawning — start immediately
         robot1_franka,
         robot2_franka,
         robot1_spawn_broadcaster,
@@ -313,7 +309,6 @@ def generate_launch_description():
         robot2_spawn_broadcaster,
         robot2_delayed_velocity,
 
-        # Everything that depends on TF + hardware being ready
         TimerAction(period=1.0, actions=[
             robot1_robot_state_publisher,
             robot2_robot_state_publisher,

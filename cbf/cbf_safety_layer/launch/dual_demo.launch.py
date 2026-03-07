@@ -82,8 +82,8 @@ def generate_launch_description():
         name='robot1_base_broadcaster',
         output='screen',
         arguments=[
-            '--x', '0', '--y', '0.4', '--z', '0',
-            '--yaw', '0', '--pitch', '0', '--roll', '0',
+            '--x', '0', '--y', '0.6', '--z', '0',
+            '--yaw', '-1.5708', '--pitch', '0', '--roll', '0',
             '--frame-id', 'base',
             '--child-frame-id', 'robot1_fer_link0'
         ]
@@ -101,11 +101,13 @@ def generate_launch_description():
             'other_frame_prefix': 'robot2_fer_',
             'reference_frame': 'base',
             'base_offset_x': 0.0,
-            'base_offset_y': 0.4,
+            'base_offset_y': 0.6,
             'base_offset_z': 0.0,
             'other_base_offset_x': 0.0,
-            'other_base_offset_y': -0.4,
+            'other_base_offset_y': -0.6,
             'other_base_offset_z': 0.0,
+            'base_yaw': -1.5708,
+            'other_base_yaw': 1.5708,
             'use_fallback_urdf': False
         }],
         remappings=[
@@ -154,8 +156,8 @@ def generate_launch_description():
         name='robot2_base_broadcaster',
         output='screen',
         arguments=[
-            '--x', '0', '--y', '-0.4', '--z', '0',
-            '--yaw', '0', '--pitch', '0', '--roll', '0',
+            '--x', '0', '--y', '-0.6', '--z', '0',
+            '--yaw', '1.5708', '--pitch', '0', '--roll', '0',
             '--frame-id', 'base',
             '--child-frame-id', 'robot2_fer_link0'
         ]
@@ -173,11 +175,13 @@ def generate_launch_description():
             'other_frame_prefix': 'robot1_fer_',
             'reference_frame': 'base',
             'base_offset_x': 0.0,
-            'base_offset_y': -0.4,
+            'base_offset_y': -0.6,
             'base_offset_z': 0.0,
             'other_base_offset_x': 0.0,
-            'other_base_offset_y': 0.4,
+            'other_base_offset_y': 0.6,
             'other_base_offset_z': 0.0,
+            'base_yaw': 1.5708,
+            'other_base_yaw': -1.5708,
             'use_fallback_urdf': False
         }],
         remappings=[

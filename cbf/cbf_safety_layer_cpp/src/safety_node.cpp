@@ -47,6 +47,8 @@ public:
         declare_parameter("other_base_offset_x", 0.0);
         declare_parameter("other_base_offset_y", 0.0);
         declare_parameter("other_base_offset_z", 0.0);
+        declare_parameter("base_yaw", 0.0);
+        declare_parameter("other_base_yaw", 0.0);
         base_offset = Eigen::Vector3d::Zero();
         other_base_offset = Eigen::Vector3d::Zero();
 
@@ -57,6 +59,11 @@ public:
         other_base_offset(0) = get_parameter("other_base_offset_x").as_double();
         other_base_offset(1) = get_parameter("other_base_offset_y").as_double();
         other_base_offset(2) = get_parameter("other_base_offset_z").as_double();
+        double y_self = get_parameter("base_yaw").as_double();
+        double y_other = get_parameter("other_base_yaw").as_double();
+        
+        R_self = Eigen::AngleAxisd(y_self, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        R_other = Eigen::AngleAxisd(y_other, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
 
         std::string self_urdf, other_urdf;
@@ -266,7 +273,8 @@ private:
     std::vector<Eigen::MatrixXd> C_rows;
     std::vector<double> l_vals;
     std::vector<double> u_vals;
-    
+
+    Eigen::Matrix3d R_self, R_other;
     Eigen::VectorXd q_safe, v_safe, v_manual_command, v_teleop_command, q_min, q_max, v_limit;
     Eigen::VectorXd q_other_robot, v_other_robot;
     Eigen::Vector3d obs_pose = {0.6, 0.0, 0.4}; 
@@ -462,7 +470,7 @@ private:
             std::lock_guard<std::mutex> lock(obs_mutex);
             obs_world = obs_pose;
         }
-        Eigen::Vector3d obs_local = obs_world - base_offset;
+        Eigen::Vector3d obs_local = R_self.transpose() * (obs_world - base_offset);
 
         C_rows.clear();
         l_vals.clear();
@@ -571,14 +579,21 @@ private:
                     auto id_start = model_other.getFrameId(cap_.start_frame);
                     auto id_end = model_other.getFrameId(cap_.end_frame);
 
-                    Eigen::Vector3d start_point = data_other.oMf[id_start].translation()+other_base_offset-base_offset;
-                    Eigen::Vector3d end_point = data_other.oMf[id_end].translation()+other_base_offset-base_offset;
+                    // 1. Get raw points from Pinocchio
+                    Eigen::Vector3d p_s_other_raw = data_other.oMf[id_start].translation();
+                    Eigen::Vector3d p_e_other_raw = data_other.oMf[id_end].translation();
+
+                    // 2. Transform them using both Rotation Matrices
+                    Eigen::Vector3d start_point = R_self.transpose() * (R_other * p_s_other_raw + other_base_offset - base_offset);
+                    Eigen::Vector3d end_point = R_self.transpose() * (R_other * p_e_other_raw + other_base_offset - base_offset);
+                    
                     Eigen::Vector3d dir_ = end_point - start_point;
                     if (dir_.norm()>1e-4){
                         dir_.normalize();
                         start_point -= dir_*0.1;
                         end_point += dir_*0.1;
                     }
+                    
                     auto [pt_start, pt_end] = closest_segments_points(p_s, p_e, start_point, end_point);
                     double dist = (pt_start - pt_end).norm();
                     double h_dyn = dist - (cap.radius + cap_.radius + safety_margin);
@@ -587,21 +602,24 @@ private:
                         Eigen::Vector3d n = (dist > 1e-5) ? ((pt_start - pt_end) / dist) : Eigen::Vector3d(1,0,0);
                         
                         // Self Jacobian
-                        Eigen::MatrixXd J_s(6, nv_self); 
-                        J_s.setZero();
+                        Eigen::MatrixXd J_s(6, nv_self); J_s.setZero();
                         pinocchio::getFrameJacobian(model_self, data_self, id_s, pinocchio::LOCAL_WORLD_ALIGNED, J_s);
                         Eigen::MatrixXd J_s_pt = J_s.topRows(3) - skew(pt_start - p_s_raw) * J_s.bottomRows(3);
                         Eigen::RowVectorXd J_rel = n.transpose() * J_s_pt;
 
-                        // Other Jacobian
+                        // 3. Other Jacobian mapped backwards through the rotations
                         Eigen::MatrixXd J_o(6, nv_other); J_o.setZero();
                         pinocchio::getFrameJacobian(model_other, data_other, id_start, pinocchio::LOCAL_WORLD_ALIGNED, J_o);
-                        Eigen::Vector3d pt_other_local = pt_end + base_offset - other_base_offset;
-                        Eigen::MatrixXd J_o_pt = J_o.topRows(3) - skew(pt_other_local- data_other.oMf[id_start].translation()) * J_o.bottomRows(3);
+                        
+                        Eigen::Vector3d pt_world = R_self * pt_end + base_offset;
+                        Eigen::Vector3d pt_other_local = R_other.transpose() * (pt_world - other_base_offset);
+                        Eigen::MatrixXd J_o_pt = J_o.topRows(3) - skew(pt_other_local - data_other.oMf[id_start].translation()) * J_o.bottomRows(3);
 
-                        // Relative velocity injection
-                        Eigen::Vector3d v_obs_vec = J_o_pt * v_other_copy;
-                        double v_obs_proj = n.dot(v_obs_vec); 
+                        // 4. Transform velocity vectors between the rotated frames
+                        Eigen::Vector3d v_obs_vec_local = J_o_pt * v_other_copy;
+                        Eigen::Vector3d v_obs_vec_self = R_self.transpose() * R_other * v_obs_vec_local; 
+                        
+                        double v_obs_proj = n.dot(v_obs_vec_self); 
                         double h_dot_dyn = J_rel.dot(v_safe) - v_obs_proj;
 
                         // Energy CBF
@@ -624,14 +642,13 @@ private:
                 }
             }
         
-        // --- Self-Collision Constraint (Dodging its own body) ---
+        // Self-Collision Constraint
             for (const auto& [name_, cap_] : capsules_self) {
                 // Prevent duplicate checks
                 if (name >= name_) continue;
 
-                // 1. ACM (Allowed Collision Matrix) Logic:
-                // Skip adjacent links AND links separated by only 1 joint.
-                // (Physical hardware limits prevent them from touching anyway)
+                // ACM (Allowed Collision Matrix) Logic:
+                // Skip adjacent links AND links separated by only 1 joint
                 auto get_idx = [](const std::string& n) {
                     if (n == "base") return 0;
                     if (n == "hand") return 7;
@@ -645,7 +662,6 @@ private:
                 Eigen::Vector3d p_s2_raw = data_self.oMf[id_s2].translation();
                 Eigen::Vector3d p_e2_raw = data_self.oMf[id_e2].translation();
                 
-                // 2. Use RAW skeleton points (No 10cm artificial padding!)
                 auto [pt1, pt2] = closest_segments_points(p_s_raw, p_e_raw, p_s2_raw, p_e2_raw);
                 double dist = (pt1 - pt2).norm();
                 double h_self = dist - (cap.radius + cap_.radius + safety_margin);
@@ -902,19 +918,13 @@ private:
         for(const auto& [name, cap] : capsules_self) {
             if (!model_self.existFrame(cap.start_frame) || !model_self.existFrame(cap.end_frame)) continue;
             
-            Eigen::Vector3d p1_raw = data_self.oMf[model_self.getFrameId(cap.start_frame)].translation();
-            Eigen::Vector3d p2_raw = data_self.oMf[model_self.getFrameId(cap.end_frame)].translation();
+            Eigen::Vector3d p_start = data_self.oMf[model_self.getFrameId(cap.start_frame)].translation();
+            Eigen::Vector3d p_end   = data_self.oMf[model_self.getFrameId(cap.end_frame)].translation();
 
-            Eigen::Vector3d p1 = p1_raw;
-            Eigen::Vector3d p2 = p2_raw;
-            Eigen::Vector3d dir = p2_raw - p1_raw;
-            
-            if (dir.norm() > 1e-4) {
-                dir.normalize();
-                double extension = 0.10; 
-                p1 = p1_raw - (dir * extension);
-                p2 = p2_raw + (dir * extension);
-            }
+            Eigen::Vector3d p_start_base = R_self*p_start + base_offset;
+            Eigen::Vector3d p_end_base   = R_self*p_end   + base_offset;
+            Eigen::Vector3d axis = p_end_base - p_start_base;
+            double raw_len = axis.norm();
             
             visualization_msgs::msg::Marker m;
             m.header.frame_id = "base"; 
@@ -924,32 +934,28 @@ private:
             m.color.g = 1.0; 
             m.color.a = 0.4; 
 
-            double len = (p2 - p1).norm();
-
-            if (len < 1e-4) {
+            if (raw_len < 1e-4) {
                 // If start and end are same point, draw a Sphere
                 m.type = visualization_msgs::msg::Marker::SPHERE;
-                m.pose.position.x = p1.x() + base_offset(0); 
-                m.pose.position.y = p1.y() + base_offset(1); 
-                m.pose.position.z = p1.z() + base_offset(2);
+                m.pose.position.x = p_start_base.x();
+                m.pose.position.y = p_start_base.y();
+                m.pose.position.z = p_start_base.z();
                 m.scale.x = m.scale.y = m.scale.z = cap.radius * 2.0;
                 m.pose.orientation.w = 1.0; 
             } else {
-                // Normal Cylinder Capsule
+                Eigen::Vector3d center_base = (p_start_base + p_end_base) * 0.5;
+                double vis_len = raw_len + 0.20;
+
+                Eigen::Quaterniond q;
+                q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), axis);
                 m.type = visualization_msgs::msg::Marker::CYLINDER;
-                m.pose.position.x = (p1.x()+p2.x())/2.0 + base_offset(0); 
-                m.pose.position.y = (p1.y()+p2.y())/2.0 + base_offset(1); 
-                m.pose.position.z = (p1.z()+p2.z())/2.0 + base_offset(2);
-                
-                Eigen::Quaterniond q; 
-                q.setFromTwoVectors(Eigen::Vector3d::UnitZ(), p2 - p1);
-                m.pose.orientation.w = q.w();
-                m.pose.orientation.x = q.x(); 
-                m.pose.orientation.y = q.y();
-                m.pose.orientation.z = q.z();
-                
-                m.scale.x = m.scale.y = cap.radius * 2.0; 
-                m.scale.z = len; 
+                m.pose.position.x = center_base.x();
+                m.pose.position.y = center_base.y();
+                m.pose.position.z = center_base.z();
+                m.pose.orientation.w = q.w(); m.pose.orientation.x = q.x();
+                m.pose.orientation.y = q.y(); m.pose.orientation.z = q.z();
+                m.scale.x = m.scale.y = cap.radius * 2.0;
+                m.scale.z = vis_len; 
             }
             ma.markers.push_back(m);
         }
