@@ -36,7 +36,7 @@ class TeleopNode(Node):
 
     def joy_cb(self, msg: Joy):
         new_target = np.zeros(9)
-        DEADZONE = 0.25
+        DEADZONE = 0.35
 
         def clean(val):
             return 0.0 if abs(val) < DEADZONE else val

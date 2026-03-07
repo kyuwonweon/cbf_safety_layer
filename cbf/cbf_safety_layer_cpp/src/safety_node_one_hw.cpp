@@ -686,11 +686,11 @@ private:
             solver_initialized = false;
         }
 
-        // HARDWARE: slew rate limiter — prevents step changes from reaching actuators
-        double max_step = 0.0015;
-        for (int i = 0; i < nv_self; ++i) {
-            double diff = v_safe(i) - v_safe_filtered(i);
-            v_safe_filtered(i) += std::clamp(diff, -max_step, max_step);
+        // HARDWARE DEFENSE: Slew Rate Limiter (Acceleration Clamp)
+        double max_step = 0.0005;
+        double ema_alpha = 0.05;
+        for (int i = 0; i < nv_; ++i) {
+            v_safe_filtered_(i) = ((1-ema_alpha) * v_safe_filtered_(i)) + (ema_alpha * v_safe_(i));
         }
 
         std_msgs::msg::Float64MultiArray cmd;
