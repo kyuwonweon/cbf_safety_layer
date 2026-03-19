@@ -4,8 +4,7 @@
 
 ## Project Demonstration
 *Watch the collision avoidance system in action below:*
-[![Watch the video](https://img.youtube.com/vi/CJ427VDBa4E/maxresdefault.jpg)](https://youtu.be/CJ427VDBa4E)
-[![CBF Safety Layer Demo](https://img.youtube.com/vi/CJ427VDBa4E/maxresdefault.jpg)](https://www.youtube.com/watch?v=CJ427VDBa4E)
+[![Watch the video](https://img.youtube.com/vi/68CW9JTyOSY/maxresdefault.jpg)](https://youtu.be/68CW9JTyOSY)
 *(Dual Arm Safety Simulation & Real-time Hardware Intervention)*
 
 ## Overview
