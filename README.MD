@@ -4,7 +4,9 @@
 
 ## Project Demonstration
 *Watch the collision avoidance system in action below:*
-
+[![Watch the video](https://img.youtube.com/vi/CJ427VDBa4E/maxresdefault.jpg)](https://youtu.be/CJ427VDBa4E)
+[![CBF Safety Layer Demo](https://img.youtube.com/vi/CJ427VDBa4E/maxresdefault.jpg)](https://www.youtube.com/watch?v=CJ427VDBa4E)
+*(Dual Arm Safety Simulation & Real-time Hardware Intervention)*
 
 ## Overview
 This package implements a **Real-Time Dynamic Collision Prevention System** for the 7-DOF Franka Emika Panda. Using Control Barrier Functions (CBF), this node acts as a transparent safety filter. It intercepts incoming joint velocity or twist commands from a human operator or global planner, and modifies them via a Quadratic Program (QP) solver running strictly at **1kHz**. 
@@ -56,14 +58,18 @@ Unlike standard kinematic safety filters, this implementation treats safety as a
 
 ### 1. The Energy-Aware Barrier Function
 Let $h(q)$ be the geometric distance between the robot capsule and a hazard. We define a dynamic barrier function $B(q, \dot{q})$ that couples this distance to the robot's kinetic energy ($E_k$):
+
 $$E_k = \frac{1}{2}\dot{q}^T M(q) \dot{q}$$
+
 $$B(q, \dot{q}) = \gamma \max(h(q), -0.05) - E_k$$
 
 To ensure the robot does not enter an unavoidable collision state, we enforce the derivative inequality $\dot{B} \ge -\alpha B$, which bounds the allowable kinetic energy relative to the distance to the obstacle.
 
 ### 2. High-Order Kinematic Constraints
 Because the robot is commanded at the acceleration level internally, we apply a PD-style High-Order CBF (HOCBF) to constrain the approach rate. Using the geometric Jacobian $J(q)$, the distance constraint is bounded by:
+
 $$l_{kin} = -k_p h(q) - k_d \dot{h}(q)$$
+
 $$l_{kin} \le J(q) \ddot{q} \le \infty$$
 
 *(Note on Dual-Arm Setup: For inter-robot collisions, the Jacobian constraint is mapped backward through a relative transformation matrix $R_{self}^T R_{other}$ to accurately project the secondary robot's velocity into the primary robot's frame).*
@@ -74,13 +80,17 @@ The solver maps the user's desired velocity into a desired acceleration $\ddot{q
 $$\min_{\ddot{q}} \frac{1}{2} || \ddot{q} - \ddot{q}_{des} ||^2$$
 
 **Subject to:**
-$$L_{cbf} \le C_{cbf} \ddot{q} \le U_{cbf} \quad \text{(Energy \& Geometry Bounds)}$$
-$$a_{min} \le \ddot{q} \le a_{max} \quad \text{(Hardware Acceleration Limits)}$$
-$$\dot{q}_{min} \le \dot{q} \le \dot{q}_{max} \quad \text{(Hardware Velocity Limits)}$$
-$$q_{min} \le q \le q_{max} \quad \text{(Hardware Joint Limits)}$$
+
+$$
+\begin{aligned}
+L_{cbf} \le C_{cbf} \ddot{q} \le U_{cbf} &\quad \text{(Energy and Geometry Bounds)} \\
+a_{min} \le \ddot{q} \le a_{max} &\quad \text{(Hardware Acceleration Limits)} \\
+\dot{q}_{min} \le \dot{q} \le \dot{q}_{max} &\quad \text{(Hardware Velocity Limits)} \\
+q_{min} \le q \le q_{max} &\quad \text{(Hardware Joint Limits)}
+\end{aligned}
+$$
 
 The optimal acceleration is integrated numerically ($v_{safe} = v_{safe} + \ddot{q}^* \Delta t$) and clamped to hardware limits before publishing.
-
 ---
 
 ## Reproduction Instructions
