@@ -1,0 +1,4 @@
+[submodule "proxsuite"]
+	path = proxsuite
+	url = https://github.com/Simple-Robotics/proxsuite.git
+	branch = devel
