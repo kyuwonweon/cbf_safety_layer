@@ -23,7 +23,7 @@ def generate_launch_description():
             package='cbf_safety_layer_cpp',
             executable='safety_node_cpp',
             output='screen',
-            parameters=[{'robot_description': robot_desc}]
+            parameters=[{'self_robot_description': robot_desc, 'hardware_mode': False}]
         ),
         Node(
             package='cbf_safety_layer_cpp',

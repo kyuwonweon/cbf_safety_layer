@@ -210,6 +210,7 @@ def generate_launch_description():
             'base_yaw': -1.5708,
             'other_base_yaw': 1.5708,
             'use_fallback_urdf':        False,
+            'hardware_mode':            True,
         }],
         remappings=[
             ('/joint_states_source',
@@ -245,6 +246,7 @@ def generate_launch_description():
             'base_yaw': 1.5708,
             'other_base_yaw': -1.5708,
             'use_fallback_urdf':        False,
+            'hardware_mode':            True,
         }],
         remappings=[
             ('/joint_states_source',

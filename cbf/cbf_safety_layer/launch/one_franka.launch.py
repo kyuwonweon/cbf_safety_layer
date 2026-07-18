@@ -53,10 +53,12 @@ def generate_launch_description():
 
     safety_node = Node(
         package='cbf_safety_layer_cpp',
-        executable='safety_node_one_hw',
+        executable='safety_node_cpp',
         output='screen',
+        parameters=[{'hardware_mode': True}],
         remappings=[
-            ('/safety/joint_states', '/joint_states'),
+            ('/joint_states_source', '/franka_robot_state_broadcaster/robot_state'),
+            ('safety/joint_states', '/joint_states'),
         ]
     )
 
@@ -83,14 +85,11 @@ def generate_launch_description():
     )
 
     joy_node = Node(package='joy', executable='joy_node')
-    teleop_node = Node(package='cbf_safety_layer', executable='teleop_node')
-    # teleop_node = Node(
-    #     package='cbf_safety_layer', 
-    #     executable='teleop_node',
-    #     remappings=[
-    #         ('/safety/input_joint_states', '/velocity_group_controller/commands'),
-    #     ]
-    # )
+    teleop_node = Node(
+        package='cbf_safety_layer',
+        executable='teleop_node',
+        remappings=[('safety/input_joint_states', '/teleop_vel')]
+    )
     return LaunchDescription([
         franka_sim,
         spawn_broadcaster,
