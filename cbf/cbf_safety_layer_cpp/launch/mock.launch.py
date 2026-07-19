@@ -7,9 +7,12 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
     franka_desc_pkg = get_package_share_directory('franka_description')
     urdf_path = os.path.join(franka_desc_pkg, 'robots', 'fer', 'fer.urdf')
-    
+
     with open(urdf_path, 'r') as f:
         robot_desc = f.read()
+
+    rviz_config = os.path.join(
+        get_package_share_directory('cbf_safety_layer'), 'config', 'visualize_franka.rviz')
 
     return LaunchDescription([
         Node(
@@ -29,11 +32,13 @@ def generate_launch_description():
             package='cbf_safety_layer_cpp',
             executable='test.py',
             name='test_mover',
-            output='screen'
+            output='screen',
+            remappings=[('/joint_states', '/joint_states_source')]
         ),
         Node(
             package='rviz2',
             executable='rviz2',
-            output='screen'
+            output='screen',
+            arguments=['-d', rviz_config]
         ),
     ])

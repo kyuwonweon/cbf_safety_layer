@@ -21,6 +21,8 @@
   <depend>libfranka</depend>
   <depend>ament_index_cpp</depend>
   <depend>eigen</depend>
+  <exec_depend>cbf_safety_layer</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

@@ -99,3 +99,25 @@ Ensure you have a working ROS 2 Kilted environment and the necessary Franka pack
 ```bash
 sudo apt install ros-kilted-franka-description ros-kilted-franka-bringup
 # Install Pinocchio and ProxQP (Refer to their respective official installation guides)
+```
+
+### 2. Build the Workspace
+```bash
+cd ~/<your_workspace>
+colcon build --packages-select cbf_safety_layer_cpp cbf_safety_layer franka_description
+source install/setup.bash
+```
+
+### 3. Run the Simulation
+
+**Single arm:**
+```bash
+ros2 launch cbf_safety_layer_cpp mock.launch.py
+```
+Brings up `robot_state_publisher`, the safety node in simulation mode, a joint-state mover, and RViz (with the safety capsules, the draggable obstacle marker, and TF pre-loaded). To actually drive the arm and see the CBF constraints engage, publish a `sensor_msgs/JointState` with a `velocity` array to `/manual_vel`.
+
+**Dual arm:**
+```bash
+ros2 launch cbf_safety_layer dual_demo.launch.py
+```
+Launches two namespaced safety nodes (`/robot1`, `/robot2`) with mirrored bases 1.2m apart, each aware of the other for inter-robot collision avoidance, plus a joystick teleop node per robot and RViz. Requires a joystick connected for `joy_node` to drive them; alternatively publish directly to `/robot1/manual_vel` and `/robot2/manual_vel`.

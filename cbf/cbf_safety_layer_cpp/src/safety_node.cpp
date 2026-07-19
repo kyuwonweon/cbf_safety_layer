@@ -703,6 +703,7 @@ private:
             l_vals.clear();
             u_vals.clear();
         }
+        apply_limits(C_t, l_t, u_t, C_rows, l_vals, u_vals, dt);
         auto t_qp_start = std::chrono::high_resolution_clock::now();
 
         double kp_acc = 10.0;
@@ -836,6 +837,13 @@ private:
             L(row_idx) = std::max({-a_max, a_v_min, a_q_min});
             U(row_idx) = std::min({a_max, a_v_max, a_q_max});
             row_idx++;
+        }
+
+        size_t wanted = Cr.size() + nv_self;
+        if (wanted > static_cast<size_t>(C.rows())) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Constraint budget exceeded: %zu wanted, %ld available - some safety constraints dropped this cycle!",
+                wanted, C.rows());
         }
     }
 
